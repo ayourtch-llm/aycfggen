@@ -6,9 +6,10 @@ use crate::sources::{
     ConfigTemplateSource, ConfigElementSource, SoftwareImageSource,
 };
 
-/// Strip all trailing whitespace/newlines and append exactly one `\n`.
+/// Strip trailing newline/carriage-return characters and append exactly one `\n`.
+/// Preserves trailing spaces on content lines — only strips `\n` and `\r`.
 fn normalize_trailing_newline(s: &str) -> String {
-    let trimmed = s.trim_end();
+    let trimmed = s.trim_end_matches(|c: char| c == '\n' || c == '\r');
     let mut result = trimmed.to_string();
     result.push('\n');
     result
@@ -66,16 +67,19 @@ impl LogicalDeviceSource for FsLogicalDeviceSource {
     fn list_devices(&self) -> Result<Vec<String>> {
         let entries = std::fs::read_dir(&self.dir)
             .with_context(|| format!("failed to read logical devices directory: {}", self.dir.display()))?;
-        let mut names: Vec<String> = entries
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if entry.file_type().ok()?.is_dir() {
-                    entry.file_name().into_string().ok()
-                } else {
-                    None
+        let mut names: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to read entry in {}", self.dir.display()))?;
+            if entry.file_type()
+                .with_context(|| format!("failed to get file type for {:?}", entry.path()))?
+                .is_dir()
+            {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push(name);
                 }
-            })
-            .collect();
+            }
+        }
         names.sort();
         Ok(names)
     }
@@ -223,16 +227,16 @@ mod tests {
         // Multiple trailing newlines: collapsed to one
         assert_eq!(normalize_trailing_newline("hello\n\n\n"), "hello\n");
 
-        // Trailing whitespace: stripped, then newline added
-        assert_eq!(normalize_trailing_newline("hello   "), "hello\n");
+        // Trailing whitespace only (no newlines): preserved, newline added
+        assert_eq!(normalize_trailing_newline("hello   "), "hello   \n");
 
-        // Trailing whitespace and newlines mixed
-        assert_eq!(normalize_trailing_newline("hello\n  \n"), "hello\n");
+        // Trailing whitespace then newlines: spaces on content line preserved
+        assert_eq!(normalize_trailing_newline("hello   \n\n"), "hello   \n");
 
-        // Multi-line content, last line has trailing spaces
+        // Multi-line content, last content line has trailing spaces
         assert_eq!(
             normalize_trailing_newline("line1\nline2   \n\n"),
-            "line1\nline2\n"
+            "line1\nline2   \n"
         );
 
         // Empty string: only a newline
@@ -326,6 +330,19 @@ mod tests {
     }
 
     // --- FsSoftwareImageSource ---
+
+    #[test]
+    fn test_validate_software_image_exists() {
+        let tmp = std::env::temp_dir().join("aycfggen_test_sw_images");
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        let image_path = tmp.join("test-image.bin");
+        std::fs::write(&image_path, b"fake image").expect("write test image");
+        let source = FsSoftwareImageSource::new(tmp.clone());
+        let result = source.validate_exists("test-image.bin");
+        assert!(result.is_ok(), "existing image should return Ok");
+        // cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn test_validate_software_image_missing() {

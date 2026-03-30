@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::model::*;
+use crate::model::{HardwareTemplate, LogicalDeviceConfig};
 
 pub trait HardwareTemplateSource {
     fn load_hardware_template(&self, sku: &str) -> Result<HardwareTemplate>;

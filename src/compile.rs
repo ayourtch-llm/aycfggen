@@ -18,7 +18,7 @@ pub fn expand_config_elements(
     element_source: &dyn ConfigElementSource,
 ) -> Result<String> {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^!!!###([a-zA-Z0-9_-]+)$").expect("valid regex")
+        Regex::new(crate::CONFIG_ELEMENT_MARKER_PATTERN).expect("valid regex")
     });
     let re = &*RE;
     let mut output = String::new();
@@ -174,9 +174,9 @@ pub fn assemble_config(
     port_block: &str,
     svi_block: &str,
 ) -> Result<String> {
-    // Validate: each marker appears at most once.
+    // Validate: each marker appears at most once (matching by trimmed line).
     for marker in &["<PORTS-CONFIGURATION>", "<SVI-CONFIGURATION>"] {
-        let count = template.matches(marker).count();
+        let count = template.lines().filter(|line| line.trim() == *marker).count();
         if count > 1 {
             anyhow::bail!(
                 "marker '{}' appears {} times in template (must appear at most once)",
@@ -199,8 +199,8 @@ pub fn assemble_config(
         format!("! SVI-START\n{}! SVI-END\n", svi_block)
     };
 
-    let has_ports_marker = template.contains("<PORTS-CONFIGURATION>");
-    let has_svi_marker = template.contains("<SVI-CONFIGURATION>");
+    let has_ports_marker = template.lines().any(|l| l.trim() == "<PORTS-CONFIGURATION>");
+    let has_svi_marker = template.lines().any(|l| l.trim() == "<SVI-CONFIGURATION>");
 
     // Replace marker lines in the template.
     let mut output = String::new();

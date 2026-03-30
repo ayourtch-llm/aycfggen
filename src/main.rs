@@ -11,6 +11,11 @@ use std::process;
 
 fn run() -> anyhow::Result<()> {
     let args = CliArgs::parse();
+
+    if args.strict {
+        eprintln!("warning: --strict mode is not yet implemented; proceeding without strict validation");
+    }
+
     let dirs = ResolvedDirs::from_cli(&args);
 
     let hw_source = FsHardwareTemplateSource::new(dirs.hardware_templates_dir.clone());
@@ -26,6 +31,11 @@ fn run() -> anyhow::Result<()> {
     } else {
         device_source.list_devices()?
     };
+
+    if device_names.is_empty() {
+        eprintln!("warning: no logical devices found in {}", dirs.logical_devices_dir.display());
+        return Ok(());
+    }
 
     let mut any_error = false;
 

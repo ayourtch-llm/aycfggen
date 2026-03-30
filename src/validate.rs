@@ -10,7 +10,7 @@ use crate::sources::{ConfigElementSource, ConfigTemplateSource, HardwareTemplate
 pub fn validate_template_markers(template: &str) -> Result<()> {
     let markers = ["<PORTS-CONFIGURATION>", "<SVI-CONFIGURATION>"];
     for marker in &markers {
-        let count = template.matches(marker).count();
+        let count = template.lines().filter(|line| line.trim() == *marker).count();
         if count > 1 {
             anyhow::bail!(
                 "marker '{}' appears {} times in template (must appear at most once)",
@@ -138,7 +138,7 @@ pub fn validate_device(
 
     // --- Config element references must exist ---
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^!!!###([a-zA-Z0-9_-]+)$").expect("valid regex")
+        Regex::new(crate::CONFIG_ELEMENT_MARKER_PATTERN).expect("valid regex")
     });
     for line in template_content.lines() {
         let trimmed = line.trim();

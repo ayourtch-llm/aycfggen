@@ -380,9 +380,14 @@ Steps: load config → validate → load template → expand elements → build 
 
 ## Module Structure Summary
 
+The crate is structured as both a library (`lib.rs`) and a binary (`main.rs`).
+All logic lives in the library so it can be reused by other Rust code.
+The binary is a thin wrapper that parses CLI args and calls library functions.
+
 ```
 src/
-├── main.rs          — entry point, CLI → compile → output
+├── lib.rs           — library root, re-exports all public modules
+├── main.rs          — binary entry point, CLI → compile → output
 ├── cli.rs           — CliArgs, ResolvedDirs
 ├── model.rs         — all data model structs (serde)
 ├── sources.rs       — trait definitions

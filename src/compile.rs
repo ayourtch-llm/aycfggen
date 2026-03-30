@@ -1,7 +1,11 @@
 use anyhow::Result;
 use regex::Regex;
 use crate::model::LogicalDeviceConfig;
-use crate::sources::{ConfigElementSource, HardwareTemplateSource, ServiceSource};
+use crate::sources::{
+    ConfigElementSource, ConfigTemplateSource, HardwareTemplateSource,
+    LogicalDeviceSource, ServiceSource, SoftwareImageSource,
+};
+use crate::validate::validate_device;
 use crate::interface_name::{derive_interface_name, resolve_slot_index_base};
 
 /// Expand !!!###<element-name> markers in a template.
@@ -141,6 +145,145 @@ pub fn build_svi_block(
     }
 
     Ok(output)
+}
+
+/// Assemble final configuration by substituting markers in the template.
+///
+/// `port_block` and `svi_block` are raw content without the surrounding marker lines.
+/// Each marker must appear at most once — returns an error if duplicate markers are found.
+///
+/// Substitution rules:
+/// - If `<PORTS-CONFIGURATION>` line is present, replace that entire line with the wrapped ports section.
+/// - If `<SVI-CONFIGURATION>` line is present, replace that entire line with the wrapped SVI section.
+/// - If a marker is absent, append the block at the end with a guidance comment.
+///   When BOTH markers are absent, the SVI block is appended first, then the ports block.
+///
+/// Wrapped block format (non-empty):
+///   `! PORTS-START\n` + port_block + `! PORTS-END\n`
+///   `! SVI-START\n` + svi_block + `! SVI-END\n`
+///
+/// Wrapped block format (empty):
+///   `! PORTS-START\n! PORTS-END\n`
+///   `! SVI-START\n! SVI-END\n`
+pub fn assemble_config(
+    template: &str,
+    port_block: &str,
+    svi_block: &str,
+) -> Result<String> {
+    // Validate: each marker appears at most once.
+    for marker in &["<PORTS-CONFIGURATION>", "<SVI-CONFIGURATION>"] {
+        let count = template.matches(marker).count();
+        if count > 1 {
+            anyhow::bail!(
+                "marker '{}' appears {} times in template (must appear at most once)",
+                marker,
+                count
+            );
+        }
+    }
+
+    // Build the wrapped sections.
+    let ports_section = if port_block.is_empty() {
+        "! PORTS-START\n! PORTS-END\n".to_string()
+    } else {
+        format!("! PORTS-START\n{}! PORTS-END\n", port_block)
+    };
+
+    let svi_section = if svi_block.is_empty() {
+        "! SVI-START\n! SVI-END\n".to_string()
+    } else {
+        format!("! SVI-START\n{}! SVI-END\n", svi_block)
+    };
+
+    let has_ports_marker = template.contains("<PORTS-CONFIGURATION>");
+    let has_svi_marker = template.contains("<SVI-CONFIGURATION>");
+
+    // Replace marker lines in the template.
+    let mut output = String::new();
+    for line in template.lines() {
+        if has_ports_marker && line.contains("<PORTS-CONFIGURATION>") {
+            output.push_str(&ports_section);
+        } else if has_svi_marker && line.contains("<SVI-CONFIGURATION>") {
+            output.push_str(&svi_section);
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    // Append missing sections at the end.
+    if !has_svi_marker && !has_ports_marker {
+        // Both missing: SVI first, then ports.
+        output.push_str("! use <SVI-CONFIGURATION> marker to place this configuration block\n");
+        output.push_str(&svi_section);
+        output.push_str("! use <PORTS-CONFIGURATION> marker to place this configuration\n");
+        output.push_str(&ports_section);
+    } else if !has_svi_marker {
+        output.push_str("! use <SVI-CONFIGURATION> marker to place this configuration block\n");
+        output.push_str(&svi_section);
+    } else if !has_ports_marker {
+        output.push_str("! use <PORTS-CONFIGURATION> marker to place this configuration\n");
+        output.push_str(&ports_section);
+    }
+
+    Ok(output)
+}
+
+/// Compile a single device configuration end-to-end.
+///
+/// Steps:
+/// 1. Load device config from `device_source`.
+/// 2. Validate the config (hard errors propagated; warnings printed to stderr).
+/// 3. Load the config template.
+/// 4. Expand config elements in the template.
+/// 5. Build the port block.
+/// 6. Build the SVI block.
+/// 7. Assemble the final configuration.
+/// 8. Return the assembled string.
+pub fn compile_device(
+    device_name: &str,
+    device_source: &dyn LogicalDeviceSource,
+    hw_source: &dyn HardwareTemplateSource,
+    service_source: &dyn ServiceSource,
+    template_source: &dyn ConfigTemplateSource,
+    element_source: &dyn ConfigElementSource,
+    image_source: &dyn SoftwareImageSource,
+) -> Result<String> {
+    // Step 1: Load device config.
+    let config = device_source.load_device_config(device_name)?;
+
+    // Step 2: Validate.
+    let warnings = validate_device(
+        device_name,
+        &config,
+        hw_source,
+        service_source,
+        template_source,
+        image_source,
+    )?;
+    for w in &warnings {
+        eprintln!("WARNING [{}]: {}", device_name, w);
+    }
+
+    // Step 3: Load config template.
+    let raw_template = template_source.load_template(&config.config_template)?;
+
+    // Step 4: Expand config elements.
+    let expanded_template = expand_config_elements(&raw_template, element_source)?;
+
+    // Step 5: Build port block.
+    let (port_block, port_warnings) = build_port_block(&config, hw_source, service_source)?;
+    for w in &port_warnings {
+        eprintln!("WARNING [{}]: {}", device_name, w);
+    }
+
+    // Step 6: Build SVI block.
+    let svi_block = build_svi_block(&config, service_source)?;
+
+    // Step 7: Assemble.
+    let result = assemble_config(&expanded_template, &port_block, &svi_block)?;
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -593,5 +736,208 @@ mod tests {
 
         let svi_block = build_svi_block(&config, &service_source).expect("build_svi_block");
         assert_eq!(svi_block, "", "no SVIs should produce empty string");
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 10: Template Assembly tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_assemble_both_markers_present() {
+        let template = "header\n<PORTS-CONFIGURATION>\n<SVI-CONFIGURATION>\nfooter\n";
+        let port_block = "interface Eth0\n no shutdown\n";
+        let svi_block = "interface Vlan10\n ip address 1.2.3.4/24\n";
+        let result = assemble_config(template, port_block, svi_block).unwrap();
+        assert!(result.contains("! PORTS-START\n"), "should contain PORTS-START marker");
+        assert!(result.contains("interface Eth0\n"), "should contain port content");
+        assert!(result.contains("! PORTS-END\n"), "should contain PORTS-END marker");
+        assert!(result.contains("! SVI-START\n"), "should contain SVI-START marker");
+        assert!(result.contains("interface Vlan10\n"), "should contain SVI content");
+        assert!(result.contains("! SVI-END\n"), "should contain SVI-END marker");
+        assert!(result.contains("header\n"), "should preserve header");
+        assert!(result.contains("footer\n"), "should preserve footer");
+        // The marker lines themselves should not appear literally
+        assert!(!result.contains("<PORTS-CONFIGURATION>"), "marker line should be replaced");
+        assert!(!result.contains("<SVI-CONFIGURATION>"), "marker line should be replaced");
+    }
+
+    #[test]
+    fn test_assemble_empty_port_block() {
+        let template = "before\n<PORTS-CONFIGURATION>\nafter\n";
+        let result = assemble_config(template, "", "").unwrap();
+        assert!(result.contains("! PORTS-START\n! PORTS-END\n"),
+            "empty port block should emit only marker lines, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_assemble_empty_svi_block() {
+        let template = "before\n<SVI-CONFIGURATION>\nafter\n";
+        let result = assemble_config(template, "", "").unwrap();
+        assert!(result.contains("! SVI-START\n! SVI-END\n"),
+            "empty SVI block should emit only marker lines, got:\n{}", result);
+    }
+
+    #[test]
+    fn test_assemble_missing_ports_marker() {
+        // Only SVI marker present — ports must be appended at the end with a comment.
+        let template = "header\n<SVI-CONFIGURATION>\nfooter\n";
+        let port_block = "interface Eth0\n";
+        let result = assemble_config(template, port_block, "svi content\n").unwrap();
+        // SVI section should be in-place
+        assert!(result.contains("! SVI-START\n"), "SVI section should be present");
+        // Ports guidance comment and section must appear at the end
+        assert!(result.contains("! use <PORTS-CONFIGURATION> marker to place this configuration\n"),
+            "missing ports marker should emit guidance comment, got:\n{}", result);
+        assert!(result.contains("! PORTS-START\n"), "PORTS-START should appear in appended block");
+        // The appended block must come after the template body
+        let footer_pos = result.find("footer").expect("footer in output");
+        let ports_comment_pos = result.find("! use <PORTS-CONFIGURATION>").expect("ports comment in output");
+        assert!(ports_comment_pos > footer_pos, "ports block must be after template body");
+        // SVI marker in template should not appear literally
+        assert!(!result.contains("<SVI-CONFIGURATION>"), "SVI marker line should be replaced");
+    }
+
+    #[test]
+    fn test_assemble_missing_svi_marker() {
+        // Only ports marker present — SVI must be appended at the end with a comment.
+        let template = "header\n<PORTS-CONFIGURATION>\nfooter\n";
+        let svi_block = "interface Vlan10\n";
+        let result = assemble_config(template, "eth content\n", svi_block).unwrap();
+        // Ports section should be in-place
+        assert!(result.contains("! PORTS-START\n"), "PORTS section should be present");
+        // SVI guidance comment and section must appear at the end
+        assert!(result.contains("! use <SVI-CONFIGURATION> marker to place this configuration block\n"),
+            "missing SVI marker should emit guidance comment, got:\n{}", result);
+        assert!(result.contains("! SVI-START\n"), "SVI-START should appear in appended block");
+        let footer_pos = result.find("footer").expect("footer in output");
+        let svi_comment_pos = result.find("! use <SVI-CONFIGURATION>").expect("svi comment in output");
+        assert!(svi_comment_pos > footer_pos, "SVI block must be after template body");
+        assert!(!result.contains("<PORTS-CONFIGURATION>"), "PORTS marker line should be replaced");
+    }
+
+    #[test]
+    fn test_assemble_both_markers_missing() {
+        let template = "header\nfooter\n";
+        let result = assemble_config(template, "port content\n", "svi content\n").unwrap();
+        // SVI should appear before ports
+        let svi_comment_pos = result.find("! use <SVI-CONFIGURATION>").expect("SVI comment not found");
+        let ports_comment_pos = result.find("! use <PORTS-CONFIGURATION>").expect("PORTS comment not found");
+        assert!(svi_comment_pos < ports_comment_pos,
+            "SVI block must appear before ports block when both markers are missing");
+        // Both sections should be present
+        assert!(result.contains("! SVI-START\n"));
+        assert!(result.contains("! PORTS-START\n"));
+    }
+
+    #[test]
+    fn test_assemble_duplicate_marker() {
+        let template = "header\n<PORTS-CONFIGURATION>\nmiddle\n<PORTS-CONFIGURATION>\nfooter\n";
+        let result = assemble_config(template, "port content\n", "");
+        assert!(result.is_err(), "duplicate marker should return an error");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("PORTS-CONFIGURATION"), "error should mention the duplicate marker: {}", err);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 11: Integration tests
+    // -------------------------------------------------------------------------
+
+    fn make_fs_sources(example_dir: &std::path::Path) -> (
+        crate::fs_sources::FsLogicalDeviceSource,
+        crate::fs_sources::FsHardwareTemplateSource,
+        crate::fs_sources::FsServiceSource,
+        crate::fs_sources::FsConfigTemplateSource,
+        FsConfigElementSource,
+        crate::fs_sources::FsSoftwareImageSource,
+    ) {
+        use crate::fs_sources::{
+            FsConfigTemplateSource, FsHardwareTemplateSource, FsLogicalDeviceSource,
+            FsServiceSource, FsSoftwareImageSource,
+        };
+        (
+            FsLogicalDeviceSource::new(example_dir.join("logical-devices")),
+            FsHardwareTemplateSource::new(example_dir.join("hardware-templates")),
+            FsServiceSource::new(example_dir.join("services")),
+            FsConfigTemplateSource::new(example_dir.join("config-templates")),
+            FsConfigElementSource::new(example_dir.join("config-elements")),
+            FsSoftwareImageSource::new(example_dir.join("software-images")),
+        )
+    }
+
+    #[test]
+    fn test_compile_device_set1() {
+        let example_dir = examples_dir().join("set1");
+        let (device_src, hw_src, svc_src, tmpl_src, elem_src, img_src) =
+            make_fs_sources(&example_dir);
+
+        let result = compile_device(
+            "switch1",
+            &device_src,
+            &hw_src,
+            &svc_src,
+            &tmpl_src,
+            &elem_src,
+            &img_src,
+        ).expect("compile_device set1 should succeed");
+
+        let expected = std::fs::read_to_string(
+            example_dir.join("expected-output/switch1.txt")
+        ).expect("read switch1.txt");
+
+        if result != expected {
+            // Show first differing line for diagnosis
+            for (i, (got, exp)) in result.lines().zip(expected.lines()).enumerate() {
+                if got != exp {
+                    panic!(
+                        "set1 output differs at line {}:\n  got: {:?}\n  exp: {:?}\n\nFull got:\n{}\n\nFull expected:\n{}",
+                        i + 1, got, exp, result, expected
+                    );
+                }
+            }
+            let got_lines = result.lines().count();
+            let exp_lines = expected.lines().count();
+            panic!(
+                "set1 output differs (got {} lines, expected {} lines)\n\nFull got:\n{}\n\nFull expected:\n{}",
+                got_lines, exp_lines, result, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_device_set2() {
+        let example_dir = examples_dir().join("set2");
+        let (device_src, hw_src, svc_src, tmpl_src, elem_src, img_src) =
+            make_fs_sources(&example_dir);
+
+        let result = compile_device(
+            "router1",
+            &device_src,
+            &hw_src,
+            &svc_src,
+            &tmpl_src,
+            &elem_src,
+            &img_src,
+        ).expect("compile_device set2 should succeed");
+
+        let expected = std::fs::read_to_string(
+            example_dir.join("expected-output/router1.txt")
+        ).expect("read router1.txt");
+
+        if result != expected {
+            for (i, (got, exp)) in result.lines().zip(expected.lines()).enumerate() {
+                if got != exp {
+                    panic!(
+                        "set2 output differs at line {}:\n  got: {:?}\n  exp: {:?}\n\nFull got:\n{}\n\nFull expected:\n{}",
+                        i + 1, got, exp, result, expected
+                    );
+                }
+            }
+            let got_lines = result.lines().count();
+            let exp_lines = expected.lines().count();
+            panic!(
+                "set2 output differs (got {} lines, expected {} lines)\n\nFull got:\n{}\n\nFull expected:\n{}",
+                got_lines, exp_lines, result, expected
+            );
+        }
     }
 }

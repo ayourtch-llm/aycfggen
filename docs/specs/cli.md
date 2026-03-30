@@ -19,7 +19,11 @@ If one or more device names are given, only those devices are compiled.
 | `--services-dir <PATH>`           | Override services directory. Default: `<config-root>/services/` |
 | `--config-templates-dir <PATH>`   | Override config templates directory. Default: `<config-root>/config-templates/` |
 | `--configs-dir <PATH>`            | Override output configs directory. Default: `<config-root>/configs/` |
-| `--strict`                 | Enable strict validation mode. |
+| `--strict`                 | Enable strict validation mode (unknown JSON fields become errors). |
+| `--dry-run`                | Perform all compilation and validation steps but do not write output files. |
+| `--preview <PATH>`         | Write output to `<PATH>` instead of the default configs directory. Use `-` for stdout. |
+
+`--dry-run` and `--preview` are mutually exclusive.
 
 ## Directory Resolution
 

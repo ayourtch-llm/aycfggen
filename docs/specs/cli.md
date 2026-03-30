@@ -6,8 +6,8 @@
 aycfggen [OPTIONS] [DEVICE_NAMES...]
 ```
 
-If no device names are given, all logical devices found in the logical devices directory are compiled.
-If one or more device names are given, only those devices are compiled. If a named device directory does not exist, it is a hard error.
+If no device names are given, all logical devices found in the logical devices directory are compiled, in alphabetical order.
+If one or more device names are given, only those devices are compiled (in the order specified). If a named device directory does not exist, it is a hard error.
 
 ## Options
 
@@ -23,7 +23,7 @@ If one or more device names are given, only those devices are compiled. If a nam
 | `--configs-dir <PATH>`            | Override output configs directory. Default: `<config-root>/configs/` |
 | `--strict`                 | Enable strict validation mode (unknown JSON fields become errors). |
 | `--dry-run`                | Perform all compilation and validation steps but do not write output files. |
-| `--preview <BANNER>`       | Write output to stdout instead of files. When compiling multiple devices, each device's output is preceded by a banner line. The `<BANNER>` parameter is a format string that may contain interpolatable variables (e.g., `"=== {{device-name}} ==="`). |
+| `--preview <BANNER>`       | Write output to stdout instead of files. When compiling multiple devices, each device's output is preceded by a banner line. The `<BANNER>` parameter is a Mustache format string (this expansion is independent of config variable expansion). Available variables: `{{device-name}}`, `{{role}}`, `{{config-template}}`. Example: `"=== {{device-name}} ({{role}}) ==="`. |
 
 `--dry-run` and `--preview` are mutually exclusive.
 

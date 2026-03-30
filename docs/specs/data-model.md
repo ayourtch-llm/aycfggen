@@ -47,7 +47,7 @@ A JSON object with the following fields:
 | Field              | Type                        | Required | Description |
 |--------------------|-----------------------------|----------|-------------|
 | `config-template`  | String                      | Yes      | Filename of the configuration template. If relative, resolved from `<config-templates-dir>`. |
-| `software-image`   | String                      | No       | Filename of software image. If relative, resolved from `<software-images-dir>`. Stored but not used during compilation. |
+| `software-image`   | String                      | No       | Filename of software image. If relative, resolved from `<software-images-dir>`. Validated for existence but not embedded in output. |
 | `role`             | String                      | No       | Free-form short string denoting the role of this device (e.g., `"access"`, `"core"`). |
 | `vendor`           | String                      | No       | Vendor identifier. Reserved for future multi-vendor support. Not used by the compiler yet. |
 | `omit-slot-prefix` | Boolean                     | No       | Default: `false`. When `true`, `modules` must contain exactly one element and that element must not be `null`. The slot index is not used in interface name construction. |
@@ -83,11 +83,11 @@ Each service directory is named after the short service name referenced in port 
 
 ### port-config.txt
 
-**Required.** Contains the interface-level configuration lines to apply to a physical port using this service.
+**Required.** Contains the interface-level configuration lines to apply to a physical port using this service. When included, any trailing newline is stripped and a single trailing newline is ensured (so the last character is always `\n` with no extra blank lines).
 
 ### svi-config.txt
 
-**Optional.** Contains the SVI (routed virtual interface) configuration associated with this service. If present, it is included once per logical device (deduplicated across ports).
+**Optional.** Contains the SVI (routed virtual interface) configuration associated with this service. If present, it is included once per logical device (deduplicated across ports). Same trailing newline normalization as `port-config.txt`.
 
 ---
 
@@ -99,7 +99,7 @@ Config elements are named configuration snippets that can be referenced from con
 
 ### apply.txt
 
-**Required.** The configuration lines to insert when the element is referenced in a template.
+**Required.** The configuration lines to insert when the element is referenced in a template. Same trailing newline normalization as service template files: trailing newline is stripped and a single trailing newline is ensured.
 
 ### unapply.txt
 
@@ -107,7 +107,9 @@ Config elements are named configuration snippets that can be referenced from con
 
 ### Referencing from templates
 
-Config elements are referenced in configuration templates via the marker syntax `!!!###<element-name>`. When the compiler encounters this marker, it replaces the entire line with the contents of the element's `apply.txt`. The original marker line is preserved as a comment above the inserted content: `! config-element: <element-name>`.
+Config element names must match `[a-zA-Z0-9_-]+`.
+
+Config elements are referenced in configuration templates via the marker syntax `!!!###<element-name>`. The marker must be the entire content of the line (leading/trailing whitespace is trimmed before matching). When the compiler encounters this marker, it replaces the entire line with the contents of the element's `apply.txt`. The original marker line is preserved as a comment above the inserted content: `! config-element: <element-name>`.
 
 ---
 
@@ -127,7 +129,7 @@ Templates may contain the following markers that are replaced during compilation
 | `<PORTS-CONFIGURATION>`  | The generated port configuration block |
 | `<SVI-CONFIGURATION>`    | The generated SVI configuration block |
 
-The canonical comment character is `#`. Vendor-specific output may use a different character (e.g., `!` for Cisco IOS). The comment character used in generated output is determined by the vendor context; for the initial Cisco IOS implementation, `!` is used.
+The canonical comment character in the specification is `#`. The initial implementation targets Cisco IOS exclusively and uses `!` as the comment character in all generated output. Future multi-vendor support may make this configurable.
 
 **If `<PORTS-CONFIGURATION>` is absent:** the port configuration block is appended at the end of the file, preceded by the vendor comment `! use <PORTS-CONFIGURATION> marker to place this configuration`.
 

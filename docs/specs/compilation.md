@@ -70,7 +70,7 @@ For each logical device:
    - If it exists, include its content in the SVI block.
 
 6. **Expand config elements:**
-   - Scan the template for lines matching `!!!###<element-name>`.
+   - Scan the template for lines that, when trimmed, match the pattern `!!!###<name>` where `<name>` matches `[a-zA-Z0-9_-]+`.
    - For each match, load `apply.txt` from `<config-elements-dir>/<element-name>/`. This is always a hard error if not found.
    - Replace the marker line with `! config-element: <element-name>` followed by the contents of `apply.txt`.
    - Config element expansion happens before ports/SVI marker substitution, so config element content may contain `<PORTS-CONFIGURATION>` or `<SVI-CONFIGURATION>` markers (though this is not recommended).
@@ -80,8 +80,8 @@ For each logical device:
    - Replace `<PORTS-CONFIGURATION>` in the template with the port configuration block (wrapped in `! PORTS-START` / `! PORTS-END`).
    - Replace `<SVI-CONFIGURATION>` in the template with the SVI configuration block (wrapped in `! SVI-START` / `! SVI-END`).
    - If a block is empty (no ports or no SVIs), emit only the marker lines (e.g., `! PORTS-START` followed by `! PORTS-END`).
-   - If either marker is missing from the template, append at the end with the appropriate comment (see data-model.md).
-   - Note: markers are replaced first, then the content is inserted, so marker strings in service configs are not re-processed.
+   - If either marker is missing from the template, append at the end with the appropriate comment (see data-model.md). When both markers are missing, the SVI block is appended first, then the ports block.
+   - Note: within this step, the marker string in the template is located and replaced with the generated block. Since service config and SVI content is already assembled into the block before substitution, marker strings appearing inside that content are not re-scanned.
 
 8. **Write output:**
    - Normal mode: save to `<configs-dir>/<device-name>.txt`. The output directory is created automatically if it does not exist.

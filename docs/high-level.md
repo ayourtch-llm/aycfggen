@@ -1,3 +1,5 @@
+**Note:** This document contains the original design notes. It has been superseded by the formal specifications in `docs/specs/`. Field names, comment characters, and constraints in the formal specs take precedence over this document.
+
 There are several input sources for the configuration generator. All the hashmaps in the descriptions below must be order-preserving.
 
 1) Hardware templates directory

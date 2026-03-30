@@ -47,7 +47,7 @@ A JSON object with the following fields:
 | Field              | Type                        | Required | Description |
 |--------------------|-----------------------------|----------|-------------|
 | `config-template`  | String                      | Yes      | Filename of the configuration template. If relative, resolved from `<config-templates-dir>`. |
-| `software`         | String                      | No       | Filename of software image. If relative, resolved from `<software-images-dir>`. Stored but not used during compilation. |
+| `software-image`   | String                      | No       | Filename of software image. If relative, resolved from `<software-images-dir>`. Stored but not used during compilation. |
 | `role`             | String                      | No       | Free-form short string denoting the role of this device (e.g., `"access"`, `"core"`). |
 | `vendor`           | String                      | No       | Vendor identifier. Reserved for future multi-vendor support. Not used by the compiler yet. |
 | `omit-slot-prefix` | Boolean                     | No       | Default: `false`. When `true`, `modules` must contain exactly one element and that element must not be `null`. The slot index is not used in interface name construction. |

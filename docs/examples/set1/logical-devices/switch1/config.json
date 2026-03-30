@@ -1,0 +1,39 @@
+{
+  "config-template": "access-switch.conf",
+  "role": "access",
+  "vendor": "cisco-ios",
+  "omit-slot-prefix": true,
+  "vars": {
+    "hostname": "switch1",
+    "location": "Building-A Floor-2"
+  },
+  "modules": [
+    {
+      "SKU": "WS-C3560-24TS",
+      "serial": "FOC1234X0AB",
+      "ports": [
+        {
+          "name": "Port0",
+          "service": "access-vlan10",
+          "prologue": "description Workstation Port\nspanning-tree portfast"
+        },
+        {
+          "name": "Port1",
+          "service": "access-vlan10"
+        },
+        {
+          "name": "Port2",
+          "service": "access-vlan10",
+          "vars": {
+            "location": "Server-Room Rack-3"
+          }
+        },
+        {
+          "name": "Port3",
+          "service": "trunk",
+          "epilogue": "no cdp enable"
+        }
+      ]
+    }
+  ]
+}

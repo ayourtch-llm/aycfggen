@@ -1,0 +1,53 @@
+!
+! Access Switch Configuration
+!
+hostname switch1
+!
+vtp mode transparent
+!
+vlan 10
+ name DATA
+!
+vlan 20
+ name VOICE
+!
+vlan 30
+ name MANAGEMENT
+!
+! PORTS-START
+interface GigabitEthernet0/0
+description Workstation Port
+spanning-tree portfast
+ switchport mode access
+ switchport access vlan 10
+ switchport nonegotiate
+ no shutdown
+interface GigabitEthernet0/1
+ switchport mode access
+ switchport access vlan 10
+ switchport nonegotiate
+ no shutdown
+interface GigabitEthernet0/2
+ switchport mode access
+ switchport access vlan 10
+ switchport nonegotiate
+ no shutdown
+interface GigabitEthernet0/3
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30
+ switchport nonegotiate
+ no shutdown
+no cdp enable
+! PORTS-END
+!
+! SVI-START
+interface Vlan10
+ description Data VLAN
+ ip address 10.1.10.1 255.255.255.0
+ no shutdown
+! SVI-END
+!
+line con 0
+ logging synchronous
+!
+end

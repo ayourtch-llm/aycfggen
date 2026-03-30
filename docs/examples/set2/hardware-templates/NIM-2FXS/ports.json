@@ -1,0 +1,7 @@
+{
+  "vendor": "cisco-ios",
+  "ports": {
+    "Port0": { "name": "FastEthernet", "index": "0/0" },
+    "Port1": { "name": "FastEthernet", "index": "0/1" }
+  }
+}

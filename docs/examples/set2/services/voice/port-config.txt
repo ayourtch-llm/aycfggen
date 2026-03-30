@@ -1,0 +1,4 @@
+ switchport mode access
+ switchport access vlan 100
+ switchport voice vlan 200
+ no shutdown

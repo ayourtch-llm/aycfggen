@@ -1,0 +1,32 @@
+{
+  "config-template": "router-base.conf",
+  "role": "branch-router",
+  "vendor": "cisco-ios",
+  "omit-slot-prefix": false,
+  "slot-index-base": 0,
+  "vars": {
+    "hostname": "router1",
+    "site-id": "BRANCH-042"
+  },
+  "modules": [
+    null,
+    {
+      "SKU": "NIM-4GE",
+      "serial": "FOC9876Y0CD",
+      "ports": [
+        { "name": "Port0", "service": "wan-link" },
+        { "name": "Port1", "service": "wan-link" },
+        { "name": "Port2", "service": "wan-link" },
+        { "name": "Port3", "service": "wan-link" }
+      ]
+    },
+    {
+      "SKU": "NIM-2FXS",
+      "serial": "FOC5555Z0EF",
+      "ports": [
+        { "name": "Port0", "service": "voice" },
+        { "name": "Port1", "service": "voice" }
+      ]
+    }
+  ]
+}

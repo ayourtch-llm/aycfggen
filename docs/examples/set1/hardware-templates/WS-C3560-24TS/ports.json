@@ -1,0 +1,9 @@
+{
+  "vendor": "cisco-ios",
+  "ports": {
+    "Port0": { "name": "GigabitEthernet", "index": "0/0" },
+    "Port1": { "name": "GigabitEthernet", "index": "0/1" },
+    "Port2": { "name": "GigabitEthernet", "index": "0/2" },
+    "Port3": { "name": "GigabitEthernet", "index": "0/3" }
+  }
+}

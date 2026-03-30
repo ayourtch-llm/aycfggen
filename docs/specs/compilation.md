@@ -6,7 +6,9 @@ The compiler processes one or more logical devices and produces a complete confi
 
 ## Interface Name Derivation
 
-The full interface name for a port is constructed from:
+The full interface name for a port is constructed as: `name + slot_number + "/" + index` (when slot prefix is used) or `name + index` (when omitted).
+
+Components:
 - The **port definition** in the hardware template (`name`, `index`)
 - The **slot number** (vector position of the module + `slot-index-base`)
 - The **`omit-slot-prefix`** flag on the logical device
@@ -25,8 +27,9 @@ The `slot-index-base` is resolved as follows (first match wins):
 - **`omit-slot-prefix: true`** — exactly one module must be present and non-null. Interface name is `name` + `index`.
   Example: `GigabitEthernet` + `0/0` → `GigabitEthernet0/0`
 
-- **`omit-slot-prefix: false`** (default) — slot number is prepended to the index, separated by `/`.
+- **`omit-slot-prefix: false`** (default) — interface name is `name` + `slot_number` + `"/"` + `index`.
   Example: slot 2, `GigabitEthernet` + `0/0` → `GigabitEthernet2/0/0`
+  Example: slot 0, `Ethernet` + `1` → `Ethernet0/1`
 
 This logic is encapsulated in a dedicated function to allow future vendor-specific customization.
 
@@ -34,7 +37,7 @@ This logic is encapsulated in a dedicated function to allow future vendor-specif
 
 For each logical device:
 
-1. **Load device config** — read `config.json` from the logical device directory.
+1. **Load device config** — read `config.json` from the logical device directory. A missing device directory is always a hard error.
 
 2. **Validate modules:**
    - If `omit-slot-prefix` is `true`, verify that `modules` has exactly one element and that element is not `null`.
@@ -49,9 +52,10 @@ For each logical device:
    - If the module has zero ports, emit a warning and skip it.
    - For each port assignment in the module (in order):
      a. Look up the port definition in `ports.json` using the port assignment's `name` field. This is always a hard error if not found.
-     b. Derive the full interface name (see rules above).
-     c. Load `port-config.txt` from `<services-dir>/<service>/`. This is always a hard error if not found.
-     d. Emit the port configuration:
+     b. Verify that no other port assignment in the same module references the same port identifier. Duplicate port assignments within a module are a hard error.
+     c. Derive the full interface name (see rules above).
+     d. Load `port-config.txt` from `<services-dir>/<service>/`. This is always a hard error if not found.
+     e. Emit the port configuration:
         ```
         interface <full-interface-name>
         <prologue lines, if any>
@@ -60,26 +64,27 @@ For each logical device:
         ```
 
 5. **Build SVI configuration block:**
-   - Collect all unique service names across all ports on the device (preserving first-occurrence order).
+   - Collect all unique service names across all ports on the device, traversing modules in slot order, then ports in list order within each module. First-occurrence order is preserved; duplicates are skipped.
+   - Null module slots are skipped during this traversal.
    - For each unique service, check if `<services-dir>/<service>/svi-config.txt` exists.
    - If it exists, include its content in the SVI block.
 
 6. **Assemble final configuration:**
+   - Each marker (`<PORTS-CONFIGURATION>`, `<SVI-CONFIGURATION>`) must appear at most once in the template. If a marker appears more than once, it is a hard error.
    - Replace `<PORTS-CONFIGURATION>` in the template with the port configuration block (wrapped in `! PORTS-START` / `! PORTS-END`).
    - Replace `<SVI-CONFIGURATION>` in the template with the SVI configuration block (wrapped in `! SVI-START` / `! SVI-END`).
-   - If either marker is missing, append at the end with the appropriate comment (see data-model.md).
+   - If a block is empty (no ports or no SVIs), emit only the marker lines (e.g., `! PORTS-START` followed by `! PORTS-END`).
+   - If either marker is missing from the template, append at the end with the appropriate comment (see data-model.md).
    - Note: markers are replaced first, then the content is inserted, so marker strings in service configs are not re-processed.
 
 7. **Write output:**
-   - Normal mode: save to `<configs-dir>/<device-name>.txt`.
+   - Normal mode: save to `<configs-dir>/<device-name>.txt`. The output directory is created automatically if it does not exist.
    - `--dry-run`: perform all compilation steps but do not write output files.
-   - `--preview <PATH>`: write output to `<PATH>` instead of the default configs directory. If `<PATH>` is `-`, write to stdout.
+   - `--preview <BANNER>`: write output to stdout. When compiling multiple devices, each device's output is preceded by a banner line generated from the `<BANNER>` format string.
 
 ## Variable Handling
 
-Device-level `vars` and port-level `vars` are defined in the data model. Port-level vars are merged on top of device-level vars (port wins on conflict), scoped to that port only.
-
-Variable expansion into templates and service configs is **out of scope** for the initial implementation. The var data is loaded and merged but not applied.
+Device-level `vars` and port-level `vars` are defined in the data model. Port-level vars are merged on top of device-level vars (port wins on conflict), scoped to that port only. The merged vars are loaded and stored for data model correctness and future use, but have no observable effect on output in the initial implementation.
 
 Future syntax (reserved, not yet implemented):
 - `{{variable}}` — Mustache-style template expansion from vars.
@@ -89,10 +94,14 @@ Future syntax (reserved, not yet implemented):
 
 The following validations are **always** performed (regardless of `--strict`):
 
+- Every device name given on the CLI must correspond to an existing logical device directory.
 - Every port assignment's `name` must exist in the corresponding hardware template's `ports.json`.
+- Duplicate port assignments (same port identifier) within a single module are not allowed.
 - Every port assignment's `service` must correspond to an existing service directory with `port-config.txt`.
 - Every `config-template` reference must resolve to an existing file.
+- If `software-image` is specified, the referenced file must exist (resolved from `<software-images-dir>` if relative).
 - If `omit-slot-prefix` is `true`, `modules` must have exactly one element which is not `null`.
+- Each marker (`<PORTS-CONFIGURATION>`, `<SVI-CONFIGURATION>`) must appear at most once in a template.
 
 ### Warnings
 

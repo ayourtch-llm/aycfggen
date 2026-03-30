@@ -1,0 +1,59 @@
+!
+! Branch Router Configuration
+!
+hostname router1
+!
+ip routing
+ip cef
+!
+! SVI-START
+interface Loopback0
+ description WAN Router-ID
+ ip address 10.255.0.42 255.255.255.255
+interface Vlan100
+ description Voice Data VLAN
+ ip address 10.100.0.1 255.255.255.0
+!
+interface Vlan200
+ description Voice VLAN
+ ip address 10.200.0.1 255.255.255.0
+ ip helper-address 10.1.1.50
+! SVI-END
+!
+ip route 0.0.0.0 0.0.0.0 dhcp
+!
+line con 0
+ logging synchronous
+line vty 0 4
+ transport input ssh
+!
+end
+! use <PORTS-CONFIGURATION> marker to place this configuration
+! PORTS-START
+interface GigabitEthernet1/0/0
+ ip address dhcp
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet1/0/1
+ ip address dhcp
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet1/0/2
+ ip address dhcp
+ no ip proxy-arp
+ no shutdown
+interface GigabitEthernet1/0/3
+ ip address dhcp
+ no ip proxy-arp
+ no shutdown
+interface FastEthernet2/0/0
+ switchport mode access
+ switchport access vlan 100
+ switchport voice vlan 200
+ no shutdown
+interface FastEthernet2/0/1
+ switchport mode access
+ switchport access vlan 100
+ switchport voice vlan 200
+ no shutdown
+! PORTS-END

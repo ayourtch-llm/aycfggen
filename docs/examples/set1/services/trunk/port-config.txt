@@ -1,0 +1,4 @@
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30
+ switchport nonegotiate
+ no shutdown

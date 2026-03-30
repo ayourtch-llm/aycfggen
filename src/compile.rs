@@ -1,5 +1,6 @@
 use anyhow::Result;
 use regex::Regex;
+use std::sync::LazyLock;
 use crate::model::LogicalDeviceConfig;
 use crate::sources::{
     ConfigElementSource, ConfigTemplateSource, HardwareTemplateSource,
@@ -16,7 +17,10 @@ pub fn expand_config_elements(
     template: &str,
     element_source: &dyn ConfigElementSource,
 ) -> Result<String> {
-    let re = Regex::new(r"^!!!###([a-zA-Z0-9_-]+)$").expect("valid regex");
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^!!!###([a-zA-Z0-9_-]+)$").expect("valid regex")
+    });
+    let re = &*RE;
     let mut output = String::new();
 
     for line in template.lines() {
@@ -123,7 +127,7 @@ pub fn build_svi_block(
 ) -> Result<String> {
     // Collect unique service names in first-occurrence order
     let mut seen = std::collections::HashSet::new();
-    let mut unique_services: Vec<String> = Vec::new();
+    let mut unique_services: Vec<&str> = Vec::new();
 
     for module_opt in &config.modules {
         let module = match module_opt {
@@ -131,8 +135,8 @@ pub fn build_svi_block(
             None => continue,
         };
         for port_assignment in &module.ports {
-            if seen.insert(port_assignment.service.clone()) {
-                unique_services.push(port_assignment.service.clone());
+            if seen.insert(port_assignment.service.as_str()) {
+                unique_services.push(&port_assignment.service);
             }
         }
     }
@@ -201,9 +205,10 @@ pub fn assemble_config(
     // Replace marker lines in the template.
     let mut output = String::new();
     for line in template.lines() {
-        if has_ports_marker && line.contains("<PORTS-CONFIGURATION>") {
+        let trimmed = line.trim();
+        if has_ports_marker && trimmed == "<PORTS-CONFIGURATION>" {
             output.push_str(&ports_section);
-        } else if has_svi_marker && line.contains("<SVI-CONFIGURATION>") {
+        } else if has_svi_marker && trimmed == "<SVI-CONFIGURATION>" {
             output.push_str(&svi_section);
         } else {
             output.push_str(line);
@@ -259,6 +264,7 @@ pub fn compile_device(
         hw_source,
         service_source,
         template_source,
+        element_source,
         image_source,
     )?;
     for w in &warnings {
@@ -385,6 +391,20 @@ mod tests {
         assert!(result.contains("logging buffered"), "apply.txt content should appear");
         // Non-marker lines should be preserved
         assert!(result.contains("hostname switch1"), "template content should be preserved");
+    }
+
+    #[test]
+    fn test_expand_set2_template() {
+        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/examples");
+        let set2 = examples.join("set2");
+        let template_content = std::fs::read_to_string(
+            set2.join("config-templates/router-base.conf")
+        ).expect("read router-base.conf");
+        let element_source = FsConfigElementSource::new(set2.join("config-elements"));
+        let result = expand_config_elements(&template_content, &element_source).unwrap();
+        assert!(!result.contains("!!!###ntp-config"), "marker should be replaced");
+        assert!(result.contains("! config-element: ntp-config"), "comment line should appear");
+        assert!(result.contains("ntp server 10.1.1.1"), "apply.txt content should appear");
     }
 
     // -------------------------------------------------------------------------

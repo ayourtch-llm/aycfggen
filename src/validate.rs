@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 
+use regex::Regex;
+use std::sync::LazyLock;
 use crate::model::LogicalDeviceConfig;
-use crate::sources::{ConfigTemplateSource, HardwareTemplateSource, ServiceSource, SoftwareImageSource};
+use crate::sources::{ConfigElementSource, ConfigTemplateSource, HardwareTemplateSource, ServiceSource, SoftwareImageSource};
 
 /// Check that each marker appears at most once in the template.
 pub fn validate_template_markers(template: &str) -> Result<()> {
@@ -29,6 +31,7 @@ pub fn validate_device(
     hw_source: &dyn HardwareTemplateSource,
     service_source: &dyn ServiceSource,
     template_source: &dyn ConfigTemplateSource,
+    element_source: &dyn ConfigElementSource,
     image_source: &dyn SoftwareImageSource,
 ) -> Result<Vec<String>> {
     let mut warnings: Vec<String> = Vec::new();
@@ -133,6 +136,25 @@ pub fn validate_device(
         )
     })?;
 
+    // --- Config element references must exist ---
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^!!!###([a-zA-Z0-9_-]+)$").expect("valid regex")
+    });
+    for line in template_content.lines() {
+        let trimmed = line.trim();
+        if let Some(caps) = RE.captures(trimmed) {
+            let element_name = &caps[1];
+            element_source
+                .load_apply(element_name)
+                .with_context(|| {
+                    format!(
+                        "device '{}': config element '{}' referenced in template '{}' does not exist",
+                        device_name, element_name, config.config_template
+                    )
+                })?;
+        }
+    }
+
     // --- Software image must exist if specified ---
     if let Some(image) = &config.software_image {
         image_source
@@ -152,7 +174,7 @@ pub fn validate_device(
 mod tests {
     use super::*;
     use crate::model::{HardwareTemplate, LogicalDeviceConfig, Module, PortAssignment, PortDefinition};
-    use crate::sources::{ConfigTemplateSource, HardwareTemplateSource, ServiceSource, SoftwareImageSource};
+    use crate::sources::{ConfigElementSource, ConfigTemplateSource, HardwareTemplateSource, ServiceSource, SoftwareImageSource};
     use anyhow::Result;
     use indexmap::IndexMap;
     use std::collections::HashMap;
@@ -279,6 +301,28 @@ mod tests {
         }
     }
 
+    struct MockElementSource {
+        elements: HashSet<String>,
+    }
+
+    impl MockElementSource {
+        fn new(elements: Vec<&str>) -> Self {
+            Self {
+                elements: elements.into_iter().map(|s| s.to_string()).collect(),
+            }
+        }
+    }
+
+    impl ConfigElementSource for MockElementSource {
+        fn load_apply(&self, element_name: &str) -> Result<String> {
+            if self.elements.contains(element_name) {
+                Ok(format!("! element {}\n", element_name))
+            } else {
+                anyhow::bail!("config element '{}' not found", element_name)
+            }
+        }
+    }
+
     // --- Helper builders ---
 
     fn simple_template() -> &'static str {
@@ -351,7 +395,8 @@ mod tests {
         let module = make_module("WS-C3560-24TS", ports);
         let config = make_config("access-switch.conf", true, vec![Some(module)]);
 
-        let result = validate_device("switch1", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("switch1", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_ok(), "valid set1 config should pass: {:?}", result.err());
         let warnings = result.unwrap();
         assert!(warnings.is_empty(), "no warnings expected");
@@ -371,7 +416,8 @@ mod tests {
         let m2 = make_module("SKU1", vec![make_port_assignment("Port0", "svc")]);
         let config = make_config("tmpl.conf", true, vec![Some(m1), Some(m2)]);
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_err(), "should error with two modules and omit-slot-prefix");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("omit-slot-prefix"), "error message should mention omit-slot-prefix: {}", msg);
@@ -387,7 +433,8 @@ mod tests {
         // [null] with omit_slot_prefix=true → error
         let config = make_config("tmpl.conf", true, vec![None]);
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_err(), "should error with null module and omit-slot-prefix");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("null"), "error message should mention null: {}", msg);
@@ -410,7 +457,8 @@ mod tests {
         let module = make_module("SKU1", ports);
         let config = make_config("tmpl.conf", false, vec![Some(module)]);
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_err(), "should error on duplicate port");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("duplicate"), "error should mention duplicate: {}", msg);
@@ -430,7 +478,8 @@ mod tests {
         let module = make_module("SKU1", ports);
         let config = make_config("tmpl.conf", false, vec![Some(module)]);
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_err(), "should error on missing port in hw template");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Port99"), "error should mention the missing port: {}", msg);
@@ -450,7 +499,8 @@ mod tests {
         let module = make_module("SKU1", ports);
         let config = make_config("tmpl.conf", false, vec![Some(module)]);
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_err(), "should error on missing service");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -474,7 +524,8 @@ mod tests {
         let module = make_module("SKU1", ports);
         let config = make_config("missing.conf", false, vec![Some(module)]);
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_err(), "should error on missing config template");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -508,7 +559,8 @@ mod tests {
         let module = make_module("SKU1", vec![]); // zero ports
         let config = make_config("tmpl.conf", false, vec![Some(module)]);
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_ok(), "zero-port module should not be an error: {:?}", result.err());
         let warnings = result.unwrap();
         assert!(!warnings.is_empty(), "should have a warning for zero-port module");
@@ -534,7 +586,8 @@ mod tests {
         let mut config = make_config("tmpl.conf", false, vec![Some(module)]);
         config.software_image = Some("firmware.bin".to_string());
 
-        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &img);
+        let elem = MockElementSource::new(vec![]);
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_err(), "should error on missing software image");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -548,15 +601,15 @@ mod tests {
     #[test]
     fn test_valid_set1_config_passes_fs() {
         use crate::fs_sources::{
-            FsConfigTemplateSource, FsHardwareTemplateSource, FsServiceSource,
-            FsSoftwareImageSource,
+            FsConfigElementSource, FsConfigTemplateSource, FsHardwareTemplateSource,
+            FsServiceSource, FsSoftwareImageSource,
         };
 
         let base = example_dir().join("set1");
         let hw = FsHardwareTemplateSource::new(base.join("hardware-templates"));
         let svc = FsServiceSource::new(base.join("services"));
         let tmpl = FsConfigTemplateSource::new(base.join("config-templates"));
-        // software-images dir doesn't matter since switch1 has no software-image
+        let elem = FsConfigElementSource::new(base.join("config-elements"));
         let img = FsSoftwareImageSource::new(base.join("software-images"));
 
         let config_path = base.join("logical-devices/switch1/config.json");
@@ -564,7 +617,59 @@ mod tests {
         let config: LogicalDeviceConfig =
             serde_json::from_str(&data).expect("deserialize config");
 
-        let result = validate_device("switch1", &config, &hw, &svc, &tmpl, &img);
+        let result = validate_device("switch1", &config, &hw, &svc, &tmpl, &elem, &img);
         assert!(result.is_ok(), "set1 switch1 should pass validation: {:?}", result.err());
+    }
+
+    /// Integration-style test: validate set2 router1 using filesystem sources
+    #[test]
+    fn test_valid_set2_config_passes_fs() {
+        use crate::fs_sources::{
+            FsConfigElementSource, FsConfigTemplateSource, FsHardwareTemplateSource,
+            FsServiceSource, FsSoftwareImageSource,
+        };
+
+        let base = example_dir().join("set2");
+        let hw = FsHardwareTemplateSource::new(base.join("hardware-templates"));
+        let svc = FsServiceSource::new(base.join("services"));
+        let tmpl = FsConfigTemplateSource::new(base.join("config-templates"));
+        let elem = FsConfigElementSource::new(base.join("config-elements"));
+        let img = FsSoftwareImageSource::new(base.join("software-images"));
+
+        let config_path = base.join("logical-devices/router1/config.json");
+        let data = std::fs::read_to_string(&config_path).expect("read config.json");
+        let config: LogicalDeviceConfig =
+            serde_json::from_str(&data).expect("deserialize config");
+
+        let result = validate_device("router1", &config, &hw, &svc, &tmpl, &elem, &img);
+        assert!(result.is_ok(), "set2 router1 should pass validation: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_missing_config_element() {
+        let hw = MockHwSource::new().with_template(
+            "SKU1",
+            vec![("Port0", "GigabitEthernet", "0/0")],
+        );
+        let svc = MockServiceSource::new(vec!["svc"]);
+        // Template references a config element
+        let tmpl = MockTemplateSource::new(vec![
+            ("tmpl.conf", "hostname test\n!!!###nonexistent-element\n<PORTS-CONFIGURATION>\n<SVI-CONFIGURATION>\n"),
+        ]);
+        let elem = MockElementSource::new(vec![]); // no elements
+        let img = MockImageSource::new(vec![]);
+
+        let ports = vec![make_port_assignment("Port0", "svc")];
+        let module = make_module("SKU1", ports);
+        let config = make_config("tmpl.conf", false, vec![Some(module)]);
+
+        let result = validate_device("dev", &config, &hw, &svc, &tmpl, &elem, &img);
+        assert!(result.is_err(), "should error on missing config element");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("nonexistent-element"),
+            "error should mention the element name: {}",
+            msg
+        );
     }
 }

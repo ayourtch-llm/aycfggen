@@ -1,0 +1,3 @@
+no logging buffered
+no logging console
+no logging monitor

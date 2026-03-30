@@ -5,7 +5,7 @@ All JSON deserialization must be lenient by default — unknown fields are ignor
 When `--strict` mode is enabled, unknown fields cause an error.
 Port identifiers (e.g., `Port0`) are case-sensitive.
 
-All data interfaces (hardware templates, logical devices, services, config templates) must be accessed through trait abstractions that allow future substitution of alternative data sources (e.g., databases, APIs). The initial implementation provides filesystem-based backends.
+All data interfaces (hardware templates, logical devices, services, config templates, config elements) must be accessed through trait abstractions that allow future substitution of alternative data sources (e.g., databases, APIs). The initial implementation provides filesystem-based backends.
 
 ## 1. Hardware Templates
 
@@ -91,7 +91,27 @@ Each service directory is named after the short service name referenced in port 
 
 ---
 
-## 4. Configuration Templates
+## 4. Config Elements
+
+**Location:** `<config-root>/config-elements/<element-name>/`
+
+Config elements are named configuration snippets that can be referenced from configuration templates. Each element directory contains:
+
+### apply.txt
+
+**Required.** The configuration lines to insert when the element is referenced in a template.
+
+### unapply.txt
+
+**Required.** The configuration lines that would reverse/remove the element. Reserved for future use (e.g., generating change sets). Not used during compilation.
+
+### Referencing from templates
+
+Config elements are referenced in configuration templates via the marker syntax `!!!###<element-name>`. When the compiler encounters this marker, it replaces the entire line with the contents of the element's `apply.txt`. The original marker line is preserved as a comment above the inserted content: `! config-element: <element-name>`.
+
+---
+
+## 5. Configuration Templates
 
 **Location:** `<config-root>/config-templates/`
 
@@ -103,6 +123,7 @@ Templates may contain the following markers that are replaced during compilation
 
 | Marker                   | Replaced with |
 |--------------------------|---------------|
+| `!!!###<element-name>`   | The contents of the named config element's `apply.txt`, preceded by `! config-element: <element-name>` |
 | `<PORTS-CONFIGURATION>`  | The generated port configuration block |
 | `<SVI-CONFIGURATION>`    | The generated SVI configuration block |
 

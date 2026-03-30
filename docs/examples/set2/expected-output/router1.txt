@@ -22,6 +22,11 @@ interface Vlan200
 !
 ip route 0.0.0.0 0.0.0.0 dhcp
 !
+! config-element: ntp-config
+ntp server 10.1.1.1
+ntp server 10.1.1.2
+ntp source Loopback0
+!
 line con 0
  logging synchronous
 line vty 0 4

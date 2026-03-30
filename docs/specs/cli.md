@@ -18,6 +18,7 @@ If one or more device names are given, only those devices are compiled. If a nam
 | `--logical-devices-dir <PATH>`    | Override logical devices directory. Default: `<config-root>/logical-devices/` |
 | `--services-dir <PATH>`           | Override services directory. Default: `<config-root>/services/` |
 | `--config-templates-dir <PATH>`   | Override config templates directory. Default: `<config-root>/config-templates/` |
+| `--config-elements-dir <PATH>`    | Override config elements directory. Default: `<config-root>/config-elements/` |
 | `--software-images-dir <PATH>`    | Override software images directory. Default: `<config-root>/software-images/` |
 | `--configs-dir <PATH>`            | Override output configs directory. Default: `<config-root>/configs/` |
 | `--strict`                 | Enable strict validation mode (unknown JSON fields become errors). |
@@ -59,6 +60,10 @@ The output directory (`configs/`) is created automatically if it does not exist.
 │       └── svi-config.txt        (optional)
 ├── config-templates/
 │   └── <template-name>
+├── config-elements/
+│   └── <element-name>/
+│       ├── apply.txt
+│       └── unapply.txt           (reserved for future use)
 ├── software-images/              (metadata, not used in compilation)
 │   └── <image-file>
 └── configs/                      (output, auto-created)

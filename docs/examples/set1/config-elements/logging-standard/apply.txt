@@ -1,0 +1,3 @@
+logging buffered 16384
+logging console warnings
+logging monitor informational

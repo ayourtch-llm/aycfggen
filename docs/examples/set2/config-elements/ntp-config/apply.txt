@@ -1,0 +1,3 @@
+ntp server 10.1.1.1
+ntp server 10.1.1.2
+ntp source Loopback0

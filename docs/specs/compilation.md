@@ -69,7 +69,13 @@ For each logical device:
    - For each unique service, check if `<services-dir>/<service>/svi-config.txt` exists.
    - If it exists, include its content in the SVI block.
 
-6. **Assemble final configuration:**
+6. **Expand config elements:**
+   - Scan the template for lines matching `!!!###<element-name>`.
+   - For each match, load `apply.txt` from `<config-elements-dir>/<element-name>/`. This is always a hard error if not found.
+   - Replace the marker line with `! config-element: <element-name>` followed by the contents of `apply.txt`.
+   - Config element expansion happens before ports/SVI marker substitution, so config element content may contain `<PORTS-CONFIGURATION>` or `<SVI-CONFIGURATION>` markers (though this is not recommended).
+
+7. **Assemble final configuration:**
    - Each marker (`<PORTS-CONFIGURATION>`, `<SVI-CONFIGURATION>`) must appear at most once in the template. If a marker appears more than once, it is a hard error.
    - Replace `<PORTS-CONFIGURATION>` in the template with the port configuration block (wrapped in `! PORTS-START` / `! PORTS-END`).
    - Replace `<SVI-CONFIGURATION>` in the template with the SVI configuration block (wrapped in `! SVI-START` / `! SVI-END`).
@@ -77,7 +83,7 @@ For each logical device:
    - If either marker is missing from the template, append at the end with the appropriate comment (see data-model.md).
    - Note: markers are replaced first, then the content is inserted, so marker strings in service configs are not re-processed.
 
-7. **Write output:**
+8. **Write output:**
    - Normal mode: save to `<configs-dir>/<device-name>.txt`. The output directory is created automatically if it does not exist.
    - `--dry-run`: perform all compilation steps but do not write output files.
    - `--preview <BANNER>`: write output to stdout. When compiling multiple devices, each device's output is preceded by a banner line generated from the `<BANNER>` format string.
@@ -99,6 +105,7 @@ The following validations are **always** performed (regardless of `--strict`):
 - Duplicate port assignments (same port identifier) within a single module are not allowed.
 - Every port assignment's `service` must correspond to an existing service directory with `port-config.txt`.
 - Every `config-template` reference must resolve to an existing file.
+- Every `!!!###<element-name>` reference in a config template must correspond to an existing config element directory with `apply.txt`.
 - If `software-image` is specified, the referenced file must exist (resolved from `<software-images-dir>` if relative).
 - If `omit-slot-prefix` is `true`, `modules` must have exactly one element which is not `null`.
 - Each marker (`<PORTS-CONFIGURATION>`, `<SVI-CONFIGURATION>`) must appear at most once in a template.

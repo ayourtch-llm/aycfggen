@@ -14,6 +14,11 @@ vlan 20
 vlan 30
  name MANAGEMENT
 !
+! config-element: logging-standard
+logging buffered 16384
+logging console warnings
+logging monitor informational
+!
 ! PORTS-START
 interface GigabitEthernet0/0
 description Workstation Port

@@ -14,7 +14,7 @@ use crate::port_decomposition::{decompose_ports, DerivedService};
 use crate::show_parsers::{parse_show_inventory, parse_show_ip_interface_brief, parse_show_version};
 use crate::svi_extraction::{extract_svis, SviAssignment};
 use crate::template_builder::{build_template, GlobalSection, NewConfigElement};
-use crate::variable_extraction::NoOpExtractor;
+use crate::variable_extraction::DefaultExtractor;
 
 // ─── ExtractionOutput ─────────────────────────────────────────────────────────
 
@@ -135,18 +135,20 @@ pub fn extract_device(
 
     // ── Stage 2: Port decomposition ───────────────────────────────────────────
     let decomp = decompose_ports(&port_blocks, existing_services, &port_id_map);
+    // Destructure decomp early so we can move services and ports independently.
+    let (decomp_services, decomp_ports) = (decomp.services, decomp.ports);
 
     // ── Stage 3: SVI extraction ───────────────────────────────────────────────
     // Build service_vlans: include BOTH new services and existing services that were matched.
     // We need the existing services' VLAN info too, or SVIs won't be assigned to reused services.
     let mut all_service_configs: Vec<(&str, &str)> = Vec::new();
-    for svc in &decomp.services {
+    for svc in &decomp_services {
         all_service_configs.push((&svc.name, &svc.port_config));
     }
     // Add existing services that were actually used by ports
-    let used_existing: std::collections::HashSet<&str> = decomp.ports.iter()
+    let used_existing: std::collections::HashSet<&str> = decomp_ports.iter()
         .map(|p| p.service_name.as_str())
-        .filter(|name| !decomp.services.iter().any(|s| s.name == *name))
+        .filter(|name| !decomp_services.iter().any(|s| s.name == *name))
         .collect();
     for name in &used_existing {
         if let Some(content) = existing_services.get(*name) {
@@ -157,7 +159,7 @@ pub fn extract_device(
     let service_vlans = build_service_vlans_from_pairs(&all_service_configs);
 
     // Service creation order: new services first (in decomp order), then existing services
-    let mut service_creation_order: Vec<String> = decomp.services.iter().map(|s| s.name.clone()).collect();
+    let mut service_creation_order: Vec<String> = decomp_services.iter().map(|s| s.name.clone()).collect();
     for name in &used_existing {
         service_creation_order.push(name.to_string());
     }
@@ -185,12 +187,12 @@ pub fn extract_device(
 
     let template_name = format!("{}-{}.conf", device.hostname, device.serial_number);
 
-    // ── Stage 5: Variable extraction (no-op) ──────────────────────────────────
+    // ── Stage 5: Variable extraction ─────────────────────────────────────────
     use crate::variable_extraction::{ExtractionArtifacts, ServiceArtifact, VariableExtractor};
-    let extractor = NoOpExtractor;
-    let _artifacts = extractor.extract(ExtractionArtifacts {
+    let extractor = DefaultExtractor;
+    let artifacts = extractor.extract(ExtractionArtifacts {
         template_content: template_result.template_content.clone(),
-        services: decomp.services.iter().map(|s| ServiceArtifact {
+        services: decomp_services.iter().map(|s| ServiceArtifact {
             name: s.name.clone(),
             port_config: s.port_config.clone(),
             svi_config: svi_result.assignments.iter()
@@ -198,19 +200,41 @@ pub fn extract_device(
                 .map(|a| a.svi_config.clone()),
             vars: HashMap::new(),
         }).collect(),
-        device_vars: IndexMap::new().into_iter().collect(),
+        device_vars: HashMap::new(),
     });
 
+    // Collect device vars (e.g., hostname) for LogicalDeviceConfig.
+    let device_vars: IndexMap<String, String> = artifacts.device_vars.into_iter().collect();
+
+    // Build a map from service name to per-service vars (e.g., vlan_id).
+    // These will be applied to port assignments for ports using each service.
+    let service_vars_map: HashMap<String, HashMap<String, String>> = artifacts
+        .services
+        .iter()
+        .filter(|s| !s.vars.is_empty())
+        .map(|s| (s.name.clone(), s.vars.clone()))
+        .collect();
+
     // ── Build LogicalDeviceConfig ──────────────────────────────────────────────
-    let device_config = build_device_config(&device, &decomp.ports, &template_name);
+    // Note: service files written to disk use the original (unparameterized) port_config
+    // from decomp_services, to ensure existing service matching works correctly on
+    // subsequent extraction passes. The per-service vars (e.g., vlan_id) are stored in
+    // PortAssignment.vars instead, where they can be used for variable expansion.
+    let device_config = build_device_config(
+        &device,
+        &decomp_ports,
+        &template_name,
+        &device_vars,
+        &service_vars_map,
+    );
 
     Ok(ExtractionOutput {
         device,
         hardware_templates,
-        services: decomp.services,
+        services: decomp_services,
         svi_assignments: svi_result.assignments,
         template_name,
-        template_content: template_result.template_content,
+        template_content: artifacts.template_content,
         new_elements: template_result.new_elements,
         device_config,
     })
@@ -302,6 +326,8 @@ fn build_device_config(
     device: &DiscoveredDevice,
     ports: &[crate::port_decomposition::DecomposedPort],
     template_name: &str,
+    device_vars: &IndexMap<String, String>,
+    service_vars_map: &HashMap<String, HashMap<String, String>>,
 ) -> LogicalDeviceConfig {
     // Build a map from interface_name to DecomposedPort for lookup.
     // Interface names are unique across all modules, unlike port_ids which repeat.
@@ -330,12 +356,17 @@ fn build_device_config(
                         format!("{}{}/{}", port_def.name, slot, port_def.index)
                     };
                     let dp = iface_map.get(iface_name.as_str())?;
+                    // Populate port vars from the service vars map (e.g., vlan_id from VlanIdExtractor)
+                    let port_vars: IndexMap<String, String> = service_vars_map
+                        .get(&dp.service_name)
+                        .map(|svars| svars.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .unwrap_or_default();
                     Some(PortAssignment {
                         name: port_id.clone(),
                         service: dp.service_name.clone(),
                         prologue: dp.prologue.clone(),
                         epilogue: dp.epilogue.clone(),
-                        vars: IndexMap::new(),
+                        vars: port_vars,
                     })
                 })
                 .collect();
@@ -365,7 +396,7 @@ fn build_device_config(
         } else {
             Some(device.slot_index_base)
         },
-        vars: IndexMap::new(),
+        vars: device_vars.clone(),
         modules,
     }
 }
@@ -453,8 +484,9 @@ end
         assert_eq!(output.template_name, "switch1-FOC9999TEST.conf");
 
         // Verify template content contains key elements
-        assert!(output.template_content.contains("hostname switch1"),
-            "template should contain hostname line");
+        // The DefaultExtractor replaces the literal hostname with a {{{hostname}}} placeholder.
+        assert!(output.template_content.contains("hostname {{{hostname}}}"),
+            "template should contain parameterized hostname placeholder");
         assert!(output.template_content.contains("<PORTS-CONFIGURATION>"),
             "template should contain PORTS marker");
         assert!(output.template_content.contains("<SVI-CONFIGURATION>"),
@@ -544,5 +576,72 @@ end
         );
 
         assert!(result.is_err(), "should fail with unparseable show version");
+    }
+
+    #[test]
+    fn test_extract_device_vars_flow_into_device_config() {
+        let existing_services: HashMap<String, String> = HashMap::new();
+        let existing_elements: HashMap<String, String> = HashMap::new();
+
+        let output = extract_device(
+            SHOW_VERSION,
+            SHOW_INVENTORY,
+            SHOW_IP_BRIEF,
+            SHOW_RUNNING_CONFIG,
+            &existing_services,
+            &existing_elements,
+        ).expect("extraction should succeed");
+
+        // The DefaultExtractor should have extracted `hostname` into device vars
+        assert_eq!(
+            output.device_config.vars.get("hostname"),
+            Some(&"switch1".to_string()),
+            "hostname should be in device_config.vars"
+        );
+
+        // The template should have the {{{hostname}}} placeholder
+        assert!(
+            output.template_content.contains("{{{hostname}}}"),
+            "template should contain hostname placeholder, got: {}",
+            output.template_content
+        );
+    }
+
+    #[test]
+    fn test_extract_device_vlan_vars_flow_into_port_assignments() {
+        let existing_services: HashMap<String, String> = HashMap::new();
+        let existing_elements: HashMap<String, String> = HashMap::new();
+
+        let output = extract_device(
+            SHOW_VERSION,
+            SHOW_INVENTORY,
+            SHOW_IP_BRIEF,
+            SHOW_RUNNING_CONFIG,
+            &existing_services,
+            &existing_elements,
+        ).expect("extraction should succeed");
+
+        // The new access-vlan10 service should exist with literal (unparameterized) port_config.
+        // Service files on disk stay literal to ensure existing-service matching on re-extraction.
+        let svc = output.services.iter().find(|s| s.name == "access-vlan10")
+            .expect("access-vlan10 service should exist");
+        assert!(
+            svc.port_config.contains("switchport access vlan 10"),
+            "service port_config should contain literal VLAN, got: {}",
+            svc.port_config
+        );
+
+        // Port assignments for access-vlan10 should have vlan_id in vars (from VlanIdExtractor).
+        let module = output.device_config.modules[0].as_ref().expect("module");
+        for port in &module.ports {
+            if port.service == "access-vlan10" {
+                assert_eq!(
+                    port.vars.get("vlan_id"),
+                    Some(&"10".to_string()),
+                    "port {} should have vlan_id=10 in vars",
+                    port.name
+                );
+            }
+        }
     }
 }

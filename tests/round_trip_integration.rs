@@ -268,8 +268,8 @@ fn test_simple_4port_switch_extraction_structure() {
         "template name should be <hostname>-<serial>.conf"
     );
     assert!(
-        output.template_content.contains("hostname switch1"),
-        "template should contain hostname"
+        output.template_content.contains("hostname {{{hostname}}}"),
+        "template should contain parameterized hostname placeholder"
     );
     assert!(
         output.template_content.contains("<PORTS-CONFIGURATION>"),

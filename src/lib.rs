@@ -13,6 +13,7 @@ pub mod port_decomposition;
 pub mod svi_extraction;
 pub mod template_builder;
 pub mod variable_extraction;
+pub mod round_trip;
 
 /// Regex pattern for config element markers: `!!!###<element-name>`
 /// Element names must match `[a-zA-Z0-9_-]+`.

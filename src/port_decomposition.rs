@@ -244,21 +244,30 @@ fn process_group(
             }
         } else {
             // Express as prologue/epilogue on the base service.
-            // Try to split: prologue = extra lines before first template line,
-            // epilogue = extra lines after last template line (or shutdown).
             for pd in dev_ports {
+                // Shutdown handling step 3: port with only "shutdown"
+                if pd.normalized_lines == vec!["shutdown".to_string()] {
+                    let shutdown_svc = get_or_create_shutdown_service(existing_services, content_to_service, result);
+                    assign_port(pd, &shutdown_svc, None, None, port_id_map, result);
+                    continue;
+                }
+
                 let (prologue, epilogue) =
                     compute_prologue_epilogue(&template_lines, &pd.normalized_lines, &pd.original_lines);
 
-                // Shutdown handling (step 6 of spec):
-                // Step 1: exact match against existing service (already handled by get_or_create).
-                // Step 2: if shutdown is the only deviation, add it as epilogue.
-                // Step 3: port with only "shutdown" → use/create "shutdown" service.
-
-                if pd.normalized_lines == vec!["shutdown".to_string()] {
-                    // Step 3: shutdown-only port
-                    let shutdown_svc = get_or_create_shutdown_service(existing_services, content_to_service, result);
-                    assign_port(pd, &shutdown_svc, None, None, port_id_map, result);
+                if prologue.is_none() && epilogue.is_none() && pd.normalized_lines != template_lines {
+                    // Unclean split — can't decompose into prologue+service+epilogue.
+                    // Create a new service for this port's full config.
+                    let full_config = normalized_to_port_config(&pd.normalized_lines);
+                    let svc_name = get_or_create_service(
+                        &full_config,
+                        &pd.normalized_lines,
+                        existing_services,
+                        content_to_service,
+                        result,
+                        service_counter,
+                    );
+                    assign_port(pd, &svc_name, None, None, port_id_map, result);
                 } else {
                     assign_port(pd, &base_service_name, prologue, epilogue, port_id_map, result);
                 }
@@ -335,7 +344,15 @@ fn derive_service_name(lines: &[String], counter: &mut usize) -> String {
             return format!("access-vlan{}", rest.trim());
         }
     }
-    // Trunk allowed vlan
+    // Channel-group (check before trunk since channel-group ports may also be trunk)
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("channel-group ") {
+            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            return format!("channel-group-{}", num);
+        }
+    }
+    // Trunk: check for allowed vlan or just trunk mode
+    let is_trunk = lines.iter().any(|l| l == "switchport mode trunk");
     for line in lines {
         if let Some(rest) = line.strip_prefix("switchport trunk allowed vlan ") {
             let vlan_part = rest.trim().replace(',', "-");
@@ -345,12 +362,8 @@ fn derive_service_name(lines: &[String], counter: &mut usize) -> String {
             return format!("trunk-vlan{}", vlan_part);
         }
     }
-    // Channel-group
-    for line in lines {
-        if let Some(rest) = line.strip_prefix("channel-group ") {
-            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            return format!("channel-group-{}", num);
-        }
+    if is_trunk {
+        return "trunk-all".to_string();
     }
     // Shutdown-only
     if lines == &["shutdown"] {
@@ -367,69 +380,112 @@ fn derive_service_name(lines: &[String], counter: &mut usize) -> String {
     format!("service-{}", n)
 }
 
-/// Compute the set of lines in `port_lines` that are NOT in `template_lines`.
-/// Uses sorted multiset difference.
+/// Compute the symmetric difference between template and port config.
+/// Returns lines added in port AND lines removed from template (sorted).
+/// This ensures two ports with different missing/added lines get different deviation sets.
 fn compute_deviation(template_lines: &[String], port_lines: &[String]) -> Vec<String> {
     let mut template_sorted: Vec<String> = template_lines.to_vec();
     template_sorted.sort();
     let mut port_sorted: Vec<String> = port_lines.to_vec();
     port_sorted.sort();
 
-    // Lines in port but not in template
-    let mut extra: Vec<String> = Vec::new();
-    let mut t_iter = template_sorted.iter().peekable();
-    for line in &port_sorted {
-        if t_iter.peek().map(|t| t.as_str()) == Some(line.as_str()) {
-            t_iter.next();
-        } else {
-            extra.push(line.clone());
+    let mut diff: Vec<String> = Vec::new();
+    let mut t_idx = 0;
+    let mut p_idx = 0;
+
+    while t_idx < template_sorted.len() && p_idx < port_sorted.len() {
+        match template_sorted[t_idx].cmp(&port_sorted[p_idx]) {
+            std::cmp::Ordering::Equal => {
+                t_idx += 1;
+                p_idx += 1;
+            }
+            std::cmp::Ordering::Less => {
+                // In template but not port (removal)
+                diff.push(format!("-{}", template_sorted[t_idx]));
+                t_idx += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                // In port but not template (addition)
+                diff.push(format!("+{}", port_sorted[p_idx]));
+                p_idx += 1;
+            }
         }
     }
-    extra
+    while t_idx < template_sorted.len() {
+        diff.push(format!("-{}", template_sorted[t_idx]));
+        t_idx += 1;
+    }
+    while p_idx < port_sorted.len() {
+        diff.push(format!("+{}", port_sorted[p_idx]));
+        p_idx += 1;
+    }
+    diff
 }
 
 /// Compute prologue and epilogue for a deviating port.
 ///
-/// The idea: find which lines in port_lines are "extra" (not in template).
-/// If all extra lines appear before the first template line in original order → prologue.
-/// If all extra lines appear after the last template line → epilogue.
-/// Mixed → split into prologue (before) and epilogue (after).
-/// If the lines are interleaved with template lines in a way that doesn't split cleanly,
-/// we fall back to creating a new service (but that's handled by the caller).
+/// Uses positional matching: walk through the port's lines and try to match
+/// each template line in order. Extra lines before the first template match
+/// are prologue, extra lines after the last template match are epilogue.
+///
+/// Returns `(None, None)` if the split is "unclean" — extra lines appear
+/// between matched template lines, meaning a clean prologue+service+epilogue
+/// decomposition is not possible. The caller should create a new service instead.
 fn compute_prologue_epilogue(
     template_lines: &[String],
     _normalized_port_lines: &[String],
     original_lines: &[String],
 ) -> (Option<String>, Option<String>) {
-    // Normalized versions of template lines for matching
-    let template_set: std::collections::HashSet<String> = template_lines.iter().cloned().collect();
-
     let normalized_original: Vec<String> = original_lines.iter().map(|l| l.trim().to_string()).collect();
 
-    // Find positions of template lines vs. extra lines
-    let mut prologue_lines: Vec<&str> = Vec::new();
-    let mut epilogue_lines: Vec<&str> = Vec::new();
-    let mut seen_template = false;
-    let mut after_all_template = false;
-    let mut template_remaining = template_lines.len();
-
-    for (idx, norm) in normalized_original.iter().enumerate() {
-        if template_set.contains(norm) {
-            seen_template = true;
-            template_remaining -= 1;
-            if template_remaining == 0 {
-                after_all_template = true;
-            }
-        } else {
-            // Extra line
-            if !seen_template {
-                prologue_lines.push(original_lines[idx].trim());
-            } else {
-                epilogue_lines.push(original_lines[idx].trim());
+    // Find the range of positions in the port's lines that correspond to template lines.
+    // Use greedy positional matching: for each template line (in order), find the next
+    // matching line in the port.
+    let mut template_match_positions: Vec<usize> = Vec::new();
+    let mut search_from = 0;
+    for tline in template_lines {
+        let mut found = false;
+        for pos in search_from..normalized_original.len() {
+            if &normalized_original[pos] == tline {
+                template_match_positions.push(pos);
+                search_from = pos + 1;
+                found = true;
+                break;
             }
         }
+        if !found {
+            // Template line not found in port — this is a removal, can't do clean split
+            return (None, None);
+        }
     }
-    let _ = after_all_template;
+
+    if template_match_positions.is_empty() {
+        // No template lines matched — entire port config is deviation
+        return (None, None);
+    }
+
+    let first_match = *template_match_positions.first().unwrap();
+    let last_match = *template_match_positions.last().unwrap();
+
+    // Check for interleaved extra lines: any non-template line between first_match and last_match?
+    let matched_set: std::collections::HashSet<usize> = template_match_positions.iter().copied().collect();
+    for pos in first_match..=last_match {
+        if !matched_set.contains(&pos) {
+            // Extra line interleaved between template lines — unclean split
+            return (None, None);
+        }
+    }
+
+    // Clean split: lines before first_match are prologue, lines after last_match are epilogue
+    let mut prologue_lines: Vec<&str> = Vec::new();
+    for pos in 0..first_match {
+        prologue_lines.push(original_lines[pos].trim());
+    }
+
+    let mut epilogue_lines: Vec<&str> = Vec::new();
+    for pos in (last_match + 1)..original_lines.len() {
+        epilogue_lines.push(original_lines[pos].trim());
+    }
 
     let prologue = if prologue_lines.is_empty() {
         None
@@ -854,13 +910,8 @@ mod tests {
     fn test_unclean_split_creates_new_service() {
         // Base: lines A, B, C
         // Port: lines A, X, B, C  → X is interleaved (between A and B)
-        // Since the deviation appears before some template lines AND after others,
-        // the split is "unclean" and the port gets both prologue and epilogue
-        // OR we just verify it doesn't panic and produces reasonable output.
-        // For this test: deviation X appears in the middle → epilogue not clean.
-        // The spec says "create a new service" in this case, but our current
-        // implementation uses prologue/epilogue heuristics — we verify no crash
-        // and reasonable output for <3 ports.
+        // Per spec: if lines can't be cleanly split into prologue+service+epilogue,
+        // create a new service instead.
         let base_lines = &["switchport mode access", "switchport access vlan 10", "spanning-tree portfast"];
         let interleaved = &[
             "switchport mode access",
@@ -885,13 +936,12 @@ mod tests {
 
         let result = decompose_ports(&blocks, &existing, &pid);
 
-        // Should not panic; outlier port should reference the base service with a prologue
+        // The interleaved port should get its own service (unclean split)
         let outlier = result.ports.iter().find(|p| p.port_id == "Port3").unwrap();
-        assert_eq!(outlier.service_name, "access-vlan10");
-        // "description INTERLEAVED" is extra; since it appears after the first template line,
-        // it ends up in prologue (before first seen template line) — depends on algorithm.
-        // The key assertion: it has some form of prologue or epilogue (not empty).
-        let has_extra = outlier.prologue.is_some() || outlier.epilogue.is_some();
-        assert!(has_extra, "interleaved deviation must produce prologue or epilogue");
+        // Should NOT use the base service with prologue/epilogue
+        assert!(outlier.prologue.is_none(), "unclean split should not produce prologue");
+        assert!(outlier.epilogue.is_none(), "unclean split should not produce epilogue");
+        // Should have its own service (2 services total: base + interleaved)
+        assert_eq!(result.services.len(), 2, "unclean split creates a new service");
     }
 }

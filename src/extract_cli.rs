@@ -347,13 +347,8 @@ fn run_extract_sections(
                     }
                     Err(diff) => {
                         println!("  Round-trip: FAIL");
-                        // Print first few diff lines for context
-                        for line in diff.lines().take(10) {
+                        for line in diff.lines() {
                             println!("    {}", line);
-                        }
-                        let total_lines = diff.lines().count();
-                        if total_lines > 10 {
-                            println!("    ... ({} more lines)", total_lines - 10);
                         }
                     }
                 }

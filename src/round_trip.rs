@@ -76,8 +76,8 @@ pub fn normalize_for_comparison(text: &str) -> String {
 
 /// Compare original config against compiled output after normalization.
 ///
-/// Returns `Ok(())` if they match after normalization, or `Err` with a diff
-/// description showing where they diverge.
+/// Returns `Ok(())` if they match after normalization, or `Err` with a unified
+/// diff showing the differences.
 pub fn verify_round_trip(original: &str, compiled: &str) -> Result<(), String> {
     let norm_original = normalize_for_comparison(original);
     let norm_compiled = normalize_for_comparison(compiled);
@@ -86,40 +86,14 @@ pub fn verify_round_trip(original: &str, compiled: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    // Build a human-readable diff (line-by-line, first difference).
-    let orig_lines: Vec<&str> = norm_original.lines().collect();
-    let comp_lines: Vec<&str> = norm_compiled.lines().collect();
+    let diff = similar::TextDiff::from_lines(&norm_original, &norm_compiled);
+    let unified = diff
+        .unified_diff()
+        .context_radius(3)
+        .header("original", "compiled")
+        .to_string();
 
-    let max_len = orig_lines.len().max(comp_lines.len());
-    let mut diff_lines: Vec<String> = Vec::new();
-    let mut found_first = false;
-
-    for i in 0..max_len {
-        let o = orig_lines.get(i).copied().unwrap_or("<missing>");
-        let c = comp_lines.get(i).copied().unwrap_or("<missing>");
-        if o != c {
-            if !found_first {
-                diff_lines.push(format!("First difference at line {}:", i + 1));
-                found_first = true;
-            }
-            diff_lines.push(format!("  original: {:?}", o));
-            diff_lines.push(format!("  compiled: {:?}", c));
-            if diff_lines.len() > 20 {
-                diff_lines.push("  ... (additional differences omitted)".to_string());
-                break;
-            }
-        }
-    }
-
-    if orig_lines.len() != comp_lines.len() {
-        diff_lines.push(format!(
-            "Line count differs: original {} vs compiled {}",
-            orig_lines.len(),
-            comp_lines.len()
-        ));
-    }
-
-    Err(diff_lines.join("\n"))
+    Err(unified)
 }
 
 #[cfg(test)]

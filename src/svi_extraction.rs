@@ -16,6 +16,23 @@ pub struct SviAssignment {
     pub vlan: u16,
 }
 
+/// Result of SVI extraction.
+pub struct SviExtractionResult {
+    /// SVIs matched to a service (get written to svi-config.txt).
+    pub assignments: Vec<SviAssignment>,
+    /// SVIs with no matching service — must be preserved as literal text
+    /// in the config template to maintain round-trip correctness.
+    pub unmatched: Vec<UnmatchedSvi>,
+}
+
+/// An SVI that could not be matched to any service.
+pub struct UnmatchedSvi {
+    /// The full interface block as literal text (e.g., "interface Vlan99\n ip address ...\n").
+    pub literal_text: String,
+    /// The VLAN number.
+    pub vlan: u16,
+}
+
 /// Assign SVIs to services based on VLAN references.
 ///
 /// # Parameters
@@ -23,14 +40,14 @@ pub struct SviAssignment {
 /// - `service_vlans` — map of `service_name -> list of VLAN numbers it references`.
 /// - `service_creation_order` — services in the order they were created in Stage 2.
 ///
-/// Returns one `SviAssignment` per SVI that was successfully matched to a service.
-/// SVIs with no matching service are not returned.
+/// Returns matched assignments and unmatched SVIs separately.
 pub fn extract_svis(
     svi_blocks: &[(String, u16, Vec<String>)],
     service_vlans: &HashMap<String, Vec<u16>>,
     service_creation_order: &[String],
-) -> Vec<SviAssignment> {
+) -> SviExtractionResult {
     let mut assignments = Vec::new();
+    let mut unmatched = Vec::new();
 
     for (svi_name, vlan, lines) in svi_blocks {
         // Find the first service (by creation order) that references this VLAN.
@@ -41,23 +58,28 @@ pub fn extract_svis(
                 .unwrap_or(false)
         });
 
-        if let Some(service_name) = owner {
-            // Build svi-config.txt: "interface <name>\n<lines>"
-            let mut config = format!("interface {}\n", svi_name);
-            for line in lines {
-                config.push_str(line);
-                config.push('\n');
-            }
+        // Build the interface block text
+        let mut config = format!("interface {}\n", svi_name);
+        for line in lines {
+            config.push_str(line);
+            config.push('\n');
+        }
 
+        if let Some(service_name) = owner {
             assignments.push(SviAssignment {
                 service_name: service_name.clone(),
                 svi_config: config,
                 vlan: *vlan,
             });
+        } else {
+            unmatched.push(UnmatchedSvi {
+                literal_text: config,
+                vlan: *vlan,
+            });
         }
     }
 
-    assignments
+    SviExtractionResult { assignments, unmatched }
 }
 
 #[cfg(test)]
@@ -88,13 +110,14 @@ mod tests {
         let service_vlans = make_service_vlans(&[("access-vlan10", &[10])]);
         let order = vec!["access-vlan10".to_string()];
 
-        let assignments = extract_svis(&svi_blocks, &service_vlans, &order);
+        let result = extract_svis(&svi_blocks, &service_vlans, &order);
 
-        assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].service_name, "access-vlan10");
-        assert_eq!(assignments[0].vlan, 10);
-        assert!(assignments[0].svi_config.contains("interface Vlan10"));
-        assert!(assignments[0].svi_config.contains("ip address 10.10.0.1"));
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.assignments[0].service_name, "access-vlan10");
+        assert_eq!(result.assignments[0].vlan, 10);
+        assert!(result.assignments[0].svi_config.contains("interface Vlan10"));
+        assert!(result.assignments[0].svi_config.contains("ip address 10.10.0.1"));
+        assert!(result.unmatched.is_empty());
     }
 
     // -------------------------------------------------------------------------
@@ -115,11 +138,11 @@ mod tests {
         // service-a was created first
         let order = vec!["service-a".to_string(), "service-b".to_string()];
 
-        let assignments = extract_svis(&svi_blocks, &service_vlans, &order);
+        let result = extract_svis(&svi_blocks, &service_vlans, &order);
 
-        assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].service_name, "service-a");
-        assert_eq!(assignments[0].vlan, 20);
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.assignments[0].service_name, "service-a");
+        assert_eq!(result.assignments[0].vlan, 20);
     }
 
     // -------------------------------------------------------------------------
@@ -137,9 +160,12 @@ mod tests {
         let service_vlans = make_service_vlans(&[("access-vlan10", &[10])]);
         let order = vec!["access-vlan10".to_string()];
 
-        let assignments = extract_svis(&svi_blocks, &service_vlans, &order);
+        let result = extract_svis(&svi_blocks, &service_vlans, &order);
 
-        assert!(assignments.is_empty(), "unmatched SVI should not be assigned");
+        assert!(result.assignments.is_empty(), "unmatched SVI should not be assigned");
+        assert_eq!(result.unmatched.len(), 1, "unmatched SVI should be returned");
+        assert_eq!(result.unmatched[0].vlan, 99);
+        assert!(result.unmatched[0].literal_text.contains("interface Vlan99"));
     }
 
     // -------------------------------------------------------------------------
@@ -172,11 +198,11 @@ mod tests {
         // svc-a was created first
         let order = vec!["svc-a".to_string(), "svc-b".to_string()];
 
-        let assignments = extract_svis(&svi_blocks, &service_vlans, &order);
+        let result = extract_svis(&svi_blocks, &service_vlans, &order);
 
-        assert_eq!(assignments.len(), 3);
+        assert_eq!(result.assignments.len(), 3);
 
-        let find_by_vlan = |v: u16| assignments.iter().find(|a| a.vlan == v);
+        let find_by_vlan = |v: u16| result.assignments.iter().find(|a| a.vlan == v);
 
         let a10 = find_by_vlan(10).expect("Vlan10 should be assigned");
         assert_eq!(a10.service_name, "svc-a");
@@ -207,10 +233,10 @@ mod tests {
         // zeta was created before alpha
         let order = vec!["zeta".to_string(), "alpha".to_string()];
 
-        let assignments = extract_svis(&svi_blocks, &service_vlans, &order);
+        let result = extract_svis(&svi_blocks, &service_vlans, &order);
 
-        assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].service_name, "zeta");
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.assignments[0].service_name, "zeta");
     }
 
     // -------------------------------------------------------------------------
@@ -230,10 +256,10 @@ mod tests {
         let service_vlans = make_service_vlans(&[("mgmt-service", &[42])]);
         let order = vec!["mgmt-service".to_string()];
 
-        let assignments = extract_svis(&svi_blocks, &service_vlans, &order);
+        let result = extract_svis(&svi_blocks, &service_vlans, &order);
 
-        assert_eq!(assignments.len(), 1);
-        let config = &assignments[0].svi_config;
+        assert_eq!(result.assignments.len(), 1);
+        let config = &result.assignments[0].svi_config;
         // Must start with "interface Vlan42\n"
         assert!(config.starts_with("interface Vlan42\n"), "config: {:?}", config);
         assert!(config.contains(" description Management VLAN\n"));
@@ -249,8 +275,9 @@ mod tests {
         let service_vlans = make_service_vlans(&[("access-vlan10", &[10])]);
         let order = vec!["access-vlan10".to_string()];
 
-        let assignments = extract_svis(&[], &service_vlans, &order);
+        let result = extract_svis(&[], &service_vlans, &order);
 
-        assert!(assignments.is_empty());
+        assert!(result.assignments.is_empty());
+        assert!(result.unmatched.is_empty());
     }
 }

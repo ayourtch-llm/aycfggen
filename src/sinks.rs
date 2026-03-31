@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::model::{HardwareTemplate, LogicalDeviceConfig};
+use crate::model::{HardwareTemplate, LogicalDeviceConfig, ServiceVars};
 
 pub trait HardwareTemplateSink {
     fn write_hardware_template(&self, sku: &str, template: &HardwareTemplate) -> Result<()>;
@@ -8,6 +8,7 @@ pub trait HardwareTemplateSink {
 pub trait ServiceSink {
     fn write_port_config(&self, service_name: &str, content: &str) -> Result<()>;
     fn write_svi_config(&self, service_name: &str, content: &str) -> Result<()>;
+    fn write_service_vars(&self, service_name: &str, vars: &ServiceVars) -> Result<()>;
 }
 
 pub trait ConfigTemplateSink {

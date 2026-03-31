@@ -166,20 +166,36 @@ pub fn extract_device(
 
     let svi_result = extract_svis(&svi_blocks, &service_vlans, &service_creation_order);
 
-    // Add unmatched SVIs back as literal text into global sections,
-    // inserted immediately after the SVI marker to preserve original ordering.
-    if !svi_result.unmatched.is_empty() {
-        let svi_marker_pos = global_sections.iter().position(|s| matches!(s, GlobalSection::SviMarker));
-        let insert_pos = svi_marker_pos.map(|p| p + 1).unwrap_or(global_sections.len());
-
-        let mut offset = 0;
-        for unmatched in &svi_result.unmatched {
-            let lines: Vec<String> = unmatched.literal_text.lines().map(|l| l.to_string()).collect();
-            if !lines.is_empty() {
-                global_sections.insert(insert_pos + offset, GlobalSection::Config(lines));
-                offset += 1;
-            }
+    // Create standalone SVI services for unmatched SVIs.
+    // Instead of inserting them as literal text in the template, we give each
+    // unmatched SVI its own service (e.g., "svi-vlan1") with empty port-config
+    // and the SVI content as svi-config. This way, build_svi_block can output
+    // ALL SVIs in VLAN order via the <SVI-CONFIGURATION> marker.
+    //
+    // Skip VLANs that already have a matched SVI assignment — this prevents
+    // duplication when multiple devices share a services directory and one
+    // device's port service already has an SVI for this VLAN.
+    let matched_vlans: std::collections::HashSet<u16> =
+        svi_result.assignments.iter().map(|a| a.vlan).collect();
+    let mut standalone_svi_services: Vec<DerivedService> = Vec::new();
+    let mut standalone_svi_assignments: Vec<SviAssignment> = Vec::new();
+    for unmatched in &svi_result.unmatched {
+        if matched_vlans.contains(&unmatched.vlan) {
+            continue; // Already covered by a matched SVI assignment
         }
+        // Use device serial in the name to avoid conflicts when multiple devices
+        // share a services directory but have different SVI content for the same VLAN.
+        let svc_name = format!("svi-{}-vlan{}", device.serial_number, unmatched.vlan);
+        standalone_svi_services.push(DerivedService {
+            name: svc_name.clone(),
+            port_config: String::new(),
+            vlan: Some(unmatched.vlan as u32),
+        });
+        standalone_svi_assignments.push(SviAssignment {
+            service_name: svc_name,
+            svi_config: unmatched.literal_text.clone(),
+            vlan: unmatched.vlan,
+        });
     }
 
     // ── Stage 4: Template builder ──────────────────────────────────────────────
@@ -220,19 +236,32 @@ pub fn extract_device(
     // from decomp_services, to ensure existing service matching works correctly on
     // subsequent extraction passes. The per-service vars (e.g., vlan_id) are stored in
     // PortAssignment.vars instead, where they can be used for variable expansion.
+    // Collect standalone SVI service names for this device's config.json
+    let standalone_svi_names: Vec<String> = standalone_svi_assignments
+        .iter()
+        .map(|a| a.service_name.clone())
+        .collect();
+
     let device_config = build_device_config(
         &device,
         &decomp_ports,
         &template_name,
         &device_vars,
         &service_vars_map,
+        &standalone_svi_names,
     );
+
+    // Merge standalone SVI services and assignments into the output.
+    let mut all_services = decomp_services;
+    all_services.extend(standalone_svi_services);
+    let mut all_svi_assignments = svi_result.assignments;
+    all_svi_assignments.extend(standalone_svi_assignments);
 
     Ok(ExtractionOutput {
         device,
         hardware_templates,
-        services: decomp_services,
-        svi_assignments: svi_result.assignments,
+        services: all_services,
+        svi_assignments: all_svi_assignments,
         template_name,
         template_content: artifacts.template_content,
         new_elements: template_result.new_elements,
@@ -328,6 +357,7 @@ fn build_device_config(
     template_name: &str,
     device_vars: &IndexMap<String, String>,
     service_vars_map: &HashMap<String, HashMap<String, String>>,
+    svi_services: &[String],
 ) -> LogicalDeviceConfig {
     // Build a map from interface_name to DecomposedPort for lookup.
     // Interface names are unique across all modules, unlike port_ids which repeat.
@@ -397,6 +427,7 @@ fn build_device_config(
             Some(device.slot_index_base)
         },
         vars: device_vars.clone(),
+        svi_services: svi_services.to_vec(),
         modules,
     }
 }

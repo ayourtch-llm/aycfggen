@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crate::model::{HardwareTemplate, LogicalDeviceConfig};
+use crate::model::{HardwareTemplate, LogicalDeviceConfig, ServiceVars};
 
 pub trait HardwareTemplateSource {
     fn load_hardware_template(&self, sku: &str) -> Result<HardwareTemplate>;
@@ -13,6 +13,7 @@ pub trait LogicalDeviceSource {
 pub trait ServiceSource {
     fn load_port_config(&self, service_name: &str) -> Result<String>;
     fn load_svi_config(&self, service_name: &str) -> Result<Option<String>>;
+    fn load_service_vars(&self, service_name: &str) -> Result<Option<ServiceVars>>;
     fn list_services(&self) -> Result<Vec<String>>;
 }
 

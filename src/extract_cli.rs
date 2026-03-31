@@ -185,15 +185,27 @@ pub fn run_extract_offline(
         }
     }
 
-    // Write new services
+    // Write new services (port-config + vars.json)
     let service_sink = FsServiceSink::new(dirs.services.clone());
     for svc in &output.services {
         service_sink.write_port_config(&svc.name, &svc.port_config)?;
+        if let Some(vlan) = svc.vlan {
+            service_sink.write_service_vars(&svc.name, &crate::model::ServiceVars {
+                vlan: Some(vlan),
+            })?;
+        }
     }
 
     // Write SVI configs for services that have them
     for svi_assignment in &output.svi_assignments {
         service_sink.write_svi_config(&svi_assignment.service_name, &svi_assignment.svi_config)?;
+        // Also write vars.json for standalone SVI services if not already written
+        let svi_vlan = svi_assignment.vlan as u32;
+        if !output.services.iter().any(|s| s.name == svi_assignment.service_name && s.vlan.is_some()) {
+            service_sink.write_service_vars(&svi_assignment.service_name, &crate::model::ServiceVars {
+                vlan: Some(svi_vlan),
+            })?;
+        }
     }
 
     // Write new config elements

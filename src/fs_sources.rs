@@ -117,6 +117,18 @@ impl ServiceSource for FsServiceSource {
         Ok(Some(normalize_trailing_newline(&data)))
     }
 
+    fn load_service_vars(&self, service_name: &str) -> Result<Option<crate::model::ServiceVars>> {
+        let path = self.dir.join(service_name).join("vars.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read vars.json for service {:?}: {}", service_name, path.display()))?;
+        let vars: crate::model::ServiceVars = serde_json::from_str(&data)
+            .with_context(|| format!("failed to parse vars.json for service {:?}", service_name))?;
+        Ok(Some(vars))
+    }
+
     fn list_services(&self) -> Result<Vec<String>> {
         let entries = std::fs::read_dir(&self.dir)
             .with_context(|| format!("failed to read services directory: {}", self.dir.display()))?;

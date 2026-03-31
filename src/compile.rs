@@ -132,31 +132,80 @@ pub fn build_svi_block(
     config: &LogicalDeviceConfig,
     service_source: &dyn ServiceSource,
 ) -> Result<String> {
-    // Collect unique service names in first-occurrence order
+    // Collect services relevant to THIS device: port-assignment services + svi_services.
+    let mut relevant_services: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut unique_services: Vec<&str> = Vec::new();
 
+    // Services from port assignments (in first-occurrence order)
     for module_opt in &config.modules {
-        let module = match module_opt {
-            Some(m) => m,
-            None => continue,
-        };
-        for port_assignment in &module.ports {
-            if seen.insert(port_assignment.service.as_str()) {
-                unique_services.push(&port_assignment.service);
+        if let Some(module) = module_opt {
+            for port in &module.ports {
+                if seen.insert(port.service.clone()) {
+                    relevant_services.push(port.service.clone());
+                }
             }
         }
     }
 
-    let mut output = String::new();
-    for service_name in &unique_services {
-        if let Some(svi_content) = service_source.load_svi_config(service_name)? {
-            let expanded = expand_vars(&svi_content, &config.vars)?;
-            output.push_str(&expanded);
+    // Standalone SVI services listed in config.json
+    for svc in &config.svi_services {
+        if seen.insert(svc.clone()) {
+            relevant_services.push(svc.clone());
         }
     }
 
+    // Collect (sort_key, expanded_content) for each service with SVI config.
+    let mut svi_entries: Vec<((u32, u32), String)> = Vec::new();
+
+    for service_name in &relevant_services {
+        if let Some(svi_content) = service_source.load_svi_config(service_name)? {
+            let expanded = expand_vars(&svi_content, &config.vars)?;
+            // Sort by (type_priority, interface_number) parsed from the SVI content.
+            // We always use the VLAN from "interface VlanN" rather than vars.json,
+            // because vars.json stores the service's primary VLAN (e.g., native VLAN
+            // for trunk services), which may differ from the SVI's VLAN number.
+            let sort_key = parse_svi_sort_key(&expanded);
+            svi_entries.push((sort_key, expanded));
+        }
+    }
+
+    // Sort by (type_priority, number) — Loopback before Vlan, then by number.
+    svi_entries.sort_by_key(|(key, _)| *key);
+
+    let mut output = String::new();
+    for ((_prio, _num), content) in &svi_entries {
+        output.push_str(content);
+    }
+
     Ok(output)
+}
+
+/// Parse a composite sort key from an SVI config block's first line.
+/// Returns (type_priority, number) where Loopback=0, Vlan=1, other=2.
+/// This matches IOS running-config ordering: Loopback before Vlan.
+fn parse_svi_sort_key(svi_content: &str) -> (u32, u32) {
+    let first_line = match svi_content.lines().next() {
+        Some(l) => l.trim().to_string(),
+        None => return (u32::MAX, u32::MAX),
+    };
+    if let Some(rest) = first_line.strip_prefix("interface Loopback") {
+        let num = rest.parse().unwrap_or(u32::MAX);
+        return (0, num);
+    }
+    if let Some(rest) = first_line.strip_prefix("interface Vlan") {
+        let num = rest.parse().unwrap_or(u32::MAX);
+        return (1, num);
+    }
+    // Other interface types (unlikely in SVI block, but handle gracefully)
+    (2, u32::MAX)
+}
+
+/// Parse the VLAN number from an SVI config block's first line ("interface VlanN").
+fn parse_svi_vlan_number(svi_content: &str) -> Option<u32> {
+    let first_line = svi_content.lines().next()?;
+    let trimmed = first_line.trim();
+    trimmed.strip_prefix("interface Vlan")
+        .and_then(|rest| rest.parse().ok())
 }
 
 /// Assemble final configuration by substituting markers in the template.
@@ -454,10 +503,16 @@ mod tests {
         fn load_svi_config(&self, name: &str) -> Result<Option<String>> {
             Ok(self.svi_configs.get(name).cloned())
         }
+        fn load_service_vars(&self, _name: &str) -> Result<Option<crate::model::ServiceVars>> {
+            Ok(None) // Mock doesn't store vars; build_svi_block falls back to parsing SVI content
+        }
         fn list_services(&self) -> Result<Vec<String>> {
-            let mut names: Vec<String> = self.port_configs.keys().cloned().collect();
-            names.sort();
-            Ok(names)
+            let mut names: std::collections::HashSet<String> =
+                self.port_configs.keys().cloned().collect();
+            names.extend(self.svi_configs.keys().cloned());
+            let mut sorted: Vec<String> = names.into_iter().collect();
+            sorted.sort();
+            Ok(sorted)
         }
     }
 
@@ -569,6 +624,7 @@ mod tests {
             omit_slot_prefix: false,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![],
         };
         let hw_source = MockHwSource { templates: HashMap::new() };
@@ -606,6 +662,7 @@ mod tests {
             omit_slot_prefix: false,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
         let hw_source = MockHwSource { templates };
@@ -657,6 +714,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
 
@@ -707,6 +765,7 @@ mod tests {
             omit_slot_prefix: false,
             slot_index_base: Some(0),
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![None, Some(module)],
         };
 
@@ -832,6 +891,7 @@ mod tests {
             omit_slot_prefix: false,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
 
@@ -872,6 +932,7 @@ mod tests {
             omit_slot_prefix: false,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
 
@@ -1081,6 +1142,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: device_vars,
+            svi_services: vec![],
             modules: vec![],
         };
 
@@ -1166,6 +1228,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
 
@@ -1209,6 +1272,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: device_vars,
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
 
@@ -1253,6 +1317,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: device_vars,
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
 
@@ -1293,6 +1358,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: device_vars,
+            svi_services: vec![],
             modules: vec![Some(module)],
         };
 
@@ -1305,6 +1371,61 @@ mod tests {
             "device vars should be expanded in SVI config, got:\n{}", svi_block);
         assert!(!svi_block.contains("{{{mgmt_vlan}}}"),
             "mustache syntax should not appear in SVI output, got:\n{}", svi_block);
+    }
+
+    // ── SVI ordering: services with svi-config but no port assignments ────────
+
+    #[test]
+    fn test_build_svi_block_includes_standalone_svi_services() {
+        // Scenario: access-vlan2 has ports AND svi-config (Vlan2),
+        // svi-vlan1 has svi-config (Vlan1) but NO ports.
+        // build_svi_block should include BOTH, in VLAN order (Vlan1 before Vlan2).
+        let mut port_configs = HashMap::new();
+        port_configs.insert("access-vlan2".to_string(), " switchport access vlan 2\n".to_string());
+        // svi-vlan1 has no port-config (standalone SVI service)
+
+        let mut svi_configs = HashMap::new();
+        svi_configs.insert("svi-vlan1".to_string(), "interface Vlan1\n no ip address\n".to_string());
+        svi_configs.insert("access-vlan2".to_string(), "interface Vlan2\n ip address dhcp\n".to_string());
+
+        let service_source = MockServiceSource { port_configs, svi_configs };
+
+        let module = Module {
+            sku: "TEST".to_string(),
+            serial: None,
+            ports: vec![
+                PortAssignment {
+                    name: "Port0".to_string(),
+                    service: "access-vlan2".to_string(),
+                    prologue: None,
+                    epilogue: None,
+                    vars: IndexMap::new(),
+                },
+            ],
+        };
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: true,
+            slot_index_base: None,
+            vars: IndexMap::new(),
+            svi_services: vec!["svi-vlan1".to_string()],
+            modules: vec![Some(module)],
+        };
+
+        let svi_block = build_svi_block(&config, &service_source).unwrap();
+
+        // Both SVIs should be present: Vlan1 from svi_services, Vlan2 from port service
+        assert!(svi_block.contains("Vlan1"), "standalone SVI service should be included");
+        assert!(svi_block.contains("Vlan2"), "port-matched SVI should be included");
+
+        // Vlan1 should come before Vlan2
+        let vlan1_pos = svi_block.find("Vlan1").unwrap();
+        let vlan2_pos = svi_block.find("Vlan2").unwrap();
+        assert!(vlan1_pos < vlan2_pos,
+            "Vlan1 should appear before Vlan2, got:\n{}", svi_block);
     }
 
     #[test]

@@ -69,6 +69,18 @@ impl ServiceSink for FsServiceSink {
             .with_context(|| format!("failed to write svi-config.txt for service {:?}: {}", service_name, path.display()))?;
         Ok(())
     }
+
+    fn write_service_vars(&self, service_name: &str, vars: &crate::model::ServiceVars) -> Result<()> {
+        let dir = self.dir.join(service_name);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create service directory for {:?}: {}", service_name, dir.display()))?;
+        let path = dir.join("vars.json");
+        let json = serde_json::to_string_pretty(vars)
+            .with_context(|| format!("failed to serialize vars.json for service {:?}", service_name))?;
+        std::fs::write(&path, json)
+            .with_context(|| format!("failed to write vars.json for service {:?}: {}", service_name, path.display()))?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +319,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![Some(Module {
                 sku: "WS-C3560-24TS".to_string(),
                 serial: Some("FOC1234X0AB".to_string()),
@@ -357,6 +370,7 @@ mod tests {
             omit_slot_prefix: false,
             slot_index_base: Some(0),
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules: vec![
                 None,
                 Some(Module {

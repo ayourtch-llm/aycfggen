@@ -12,6 +12,8 @@ pub struct DerivedService {
     pub name: String,
     /// The service template (port-config.txt content).
     pub port_config: String,
+    /// Primary VLAN number (for vars.json), if determinable.
+    pub vlan: Option<u32>,
 }
 
 /// A port assignment produced by the decomposition.
@@ -413,6 +415,7 @@ fn get_or_create_shutdown_service(
     result.services.push(DerivedService {
         name: "shutdown".to_string(),
         port_config: content,
+        vlan: None,
     });
     "shutdown".to_string()
 }
@@ -473,12 +476,37 @@ fn get_or_create_service(
         }
     }
 
+    let vlan = extract_primary_vlan(normalized_lines);
     content_to_service.insert(key, name.clone());
     result.services.push(DerivedService {
         name: name.clone(),
         port_config: port_config.to_string(),
+        vlan,
     });
     name
+}
+
+/// Extract the primary VLAN number from normalized config lines.
+/// For access ports: the access VLAN.
+/// For trunk ports: the native VLAN (if set).
+/// For other modes: None.
+fn extract_primary_vlan(lines: &[String]) -> Option<u32> {
+    let is_trunk = lines.iter().any(|l| l == "switchport mode trunk");
+    if is_trunk {
+        // For trunk ports, use the native VLAN if set
+        for line in lines {
+            if let Some(rest) = line.strip_prefix("switchport trunk native vlan ") {
+                return rest.trim().parse().ok();
+            }
+        }
+        return None;
+    }
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("switchport access vlan ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
 }
 
 /// Derive a service name from normalized config lines.

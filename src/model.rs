@@ -1,6 +1,14 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+/// Per-service metadata stored in `vars.json`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ServiceVars {
+    /// Primary VLAN number for this service (access VLAN, SVI VLAN, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareTemplate {
     pub vendor: Option<String>,
@@ -29,6 +37,10 @@ pub struct LogicalDeviceConfig {
     pub slot_index_base: Option<u32>,
     #[serde(default)]
     pub vars: IndexMap<String, String>,
+    /// Additional services whose SVIs should be included in this device's SVI block.
+    /// Covers standalone SVI services (VLANs not associated with any port service).
+    #[serde(rename = "svi-services", default, skip_serializing_if = "Vec::is_empty")]
+    pub svi_services: Vec<String>,
     pub modules: Vec<Option<Module>>,
 }
 

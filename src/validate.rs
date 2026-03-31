@@ -257,6 +257,10 @@ mod tests {
             Ok(None)
         }
 
+        fn load_service_vars(&self, _service_name: &str) -> Result<Option<crate::model::ServiceVars>> {
+            Ok(None)
+        }
+
         fn list_services(&self) -> Result<Vec<String>> {
             let mut names: Vec<String> = self.services.iter().cloned().collect();
             names.sort();
@@ -377,6 +381,7 @@ mod tests {
             omit_slot_prefix,
             slot_index_base: None,
             vars: IndexMap::new(),
+            svi_services: vec![],
             modules,
         }
     }

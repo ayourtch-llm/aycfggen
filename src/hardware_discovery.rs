@@ -30,8 +30,30 @@ const KNOWN_PREFIXES: &[&str] = &[
     "Vlan",
 ];
 
+/// Abbreviated prefixes mapped to their canonical (full) form.
+/// `show ip interface brief` and `show interfaces status` use these short forms.
+/// Ordered longest-first to avoid ambiguous matching (e.g., "Tw" before "Te").
+const ABBREVIATED_PREFIXES: &[(&str, &str)] = &[
+    ("App", "AppGigabitEthernet"),
+    ("Two", "TwoGigabitEthernet"),
+    ("Tw", "TwentyFiveGigE"),
+    ("Fo", "FortyGigabitEthernet"),
+    ("Te", "TenGigabitEthernet"),
+    ("Fi", "FiveGigabitEthernet"),
+    ("Hu", "HundredGigE"),
+    ("Gi", "GigabitEthernet"),
+    ("Fa", "FastEthernet"),
+    ("Et", "Ethernet"),
+    ("Se", "Serial"),
+    ("Lo", "Loopback"),
+    ("Po", "Port-channel"),
+    ("Tu", "Tunnel"),
+    ("Vl", "Vlan"),
+];
+
 /// Prefixes that indicate virtual (non-physical) interfaces — excluded from ports.json.
 const VIRTUAL_PREFIXES: &[&str] = &["Loopback", "Port-channel", "Tunnel", "Vlan"];
+
 
 // ─── ParsedInterfaceName ──────────────────────────────────────────────────────
 
@@ -57,9 +79,18 @@ pub struct ParsedInterfaceName {
 ///
 /// Returns `None` if the name does not match any known prefix or has an unexpected format.
 pub fn parse_interface_name(name: &str, is_multi_module: bool) -> Option<ParsedInterfaceName> {
-    // Find which known prefix matches
-    let prefix = KNOWN_PREFIXES.iter().find(|&&p| name.starts_with(p))?;
-    let after_prefix = &name[prefix.len()..];
+    // Find which known prefix matches — try full names first, then abbreviated forms.
+    let (canonical_prefix, after_prefix) =
+        if let Some(prefix) = KNOWN_PREFIXES.iter().find(|&&p| name.starts_with(p)) {
+            (*prefix, &name[prefix.len()..])
+        } else if let Some(&(abbrev, canonical)) =
+            ABBREVIATED_PREFIXES.iter().find(|&&(a, _)| name.starts_with(a))
+        {
+            (canonical, &name[abbrev.len()..])
+        } else {
+            return None;
+        };
+    let prefix = canonical_prefix;
 
     // Strip sub-interface suffix first: look for a dot that is followed by digits at the end
     let (numeric_part, sub_interface) = if let Some(dot_pos) = after_prefix.rfind('.') {
@@ -173,21 +204,28 @@ pub fn discover_hardware(
     // interface names have 3+ slash-separated segments (e.g., GigabitEthernet1/0/1),
     // indicating a slot prefix even for single-module stacks.
     let ifaces_look_multi = interfaces.iter().any(|e| {
-        // Skip virtual prefixes
+        // Skip virtual prefixes (full and abbreviated)
         for vp in VIRTUAL_PREFIXES {
             if e.name.starts_with(vp) {
                 return false;
             }
         }
-        // Check if the numeric portion after the prefix has 3+ slash-separated segments
-        for prefix in KNOWN_PREFIXES {
-            if e.name.starts_with(prefix) {
-                let after = &e.name[prefix.len()..];
-                // Strip sub-interface suffix for counting
-                let numeric = after.split('.').next().unwrap_or(after);
-                let slash_count = numeric.chars().filter(|&c| c == '/').count();
-                return slash_count >= 2; // e.g., "1/0/1" has 2 slashes = 3 segments
-            }
+        // Check if the numeric portion after the prefix has 3+ slash-separated segments.
+        // Try full prefixes first, then abbreviated.
+        let after: Option<&str> = KNOWN_PREFIXES
+            .iter()
+            .find(|&&p| e.name.starts_with(p))
+            .map(|p| &e.name[p.len()..])
+            .or_else(|| {
+                ABBREVIATED_PREFIXES
+                    .iter()
+                    .find(|&&(a, _)| e.name.starts_with(a))
+                    .map(|&(a, _)| &e.name[a.len()..])
+            });
+        if let Some(after) = after {
+            let numeric = after.split('.').next().unwrap_or(after);
+            let slash_count = numeric.chars().filter(|&c| c == '/').count();
+            return slash_count >= 2;
         }
         false
     });
@@ -198,9 +236,14 @@ pub fn discover_hardware(
     let physical_ifaces: Vec<ParsedInterfaceName> = interfaces
         .iter()
         .filter_map(|e| {
-            // Skip known virtual prefixes early
+            // Skip known virtual prefixes (full and abbreviated)
             for vp in VIRTUAL_PREFIXES {
                 if e.name.starts_with(vp) {
+                    return None;
+                }
+            }
+            for &(abbrev, canonical) in ABBREVIATED_PREFIXES {
+                if e.name.starts_with(abbrev) && VIRTUAL_PREFIXES.contains(&canonical) {
                     return None;
                 }
             }
@@ -294,22 +337,10 @@ pub fn discover_hardware(
         // Build the ports.json for this slot
         let ifaces_for_slot = slot_to_ifaces.get(&slot).map(|v| v.as_slice()).unwrap_or(&[]);
 
-        // Sort by port_index so Port0, Port1, ... are in a stable, meaningful order
-        let mut sorted_ifaces: Vec<&&ParsedInterfaceName> = ifaces_for_slot.iter().collect();
-        sorted_ifaces.sort_by(|a, b| {
-            // Numeric-aware sort: split on '/' and compare segments numerically
-            let a_parts: Vec<u32> = a
-                .port_index
-                .split('/')
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            let b_parts: Vec<u32> = b
-                .port_index
-                .split('/')
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            a_parts.cmp(&b_parts)
-        });
+        // Preserve the order from `show ip interface brief` — this matches the order
+        // interfaces appear in the running config. No re-sorting needed since the
+        // source array already has the device's canonical ordering.
+        let sorted_ifaces: Vec<&&ParsedInterfaceName> = ifaces_for_slot.iter().collect();
 
         let mut ports: IndexMap<String, PortDefinition> = IndexMap::new();
         for (idx, iface) in sorted_ifaces.iter().enumerate() {
@@ -779,5 +810,98 @@ GigabitEthernet3/0/2   unassigned      YES unset  up                    up
         // Slot 3 matches inventory Switch 3 (inv slot 2, +1 = iface slot 3)
         assert_eq!(device.modules[1].serial, "FOC_SW3");
         assert_eq!(device.modules[1].slot, 3);
+    }
+
+    // ── Abbreviated prefix tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_abbreviated_te() {
+        let p = parse_interface_name("Te1/1/3", true).unwrap();
+        assert_eq!(p.prefix, "TenGigabitEthernet");
+        assert_eq!(p.slot, Some(1));
+        assert_eq!(p.port_index, "1/3");
+    }
+
+    #[test]
+    fn test_parse_abbreviated_gi() {
+        let p = parse_interface_name("Gi1/0/1", true).unwrap();
+        assert_eq!(p.prefix, "GigabitEthernet");
+        assert_eq!(p.slot, Some(1));
+        assert_eq!(p.port_index, "0/1");
+    }
+
+    #[test]
+    fn test_parse_abbreviated_fa() {
+        let p = parse_interface_name("Fa0/1", false).unwrap();
+        assert_eq!(p.prefix, "FastEthernet");
+        assert_eq!(p.port_index, "0/1");
+    }
+
+    #[test]
+    fn test_parse_abbreviated_vlan_filtered() {
+        // Vl1 should parse as Vlan (virtual, would be filtered in discovery)
+        let p = parse_interface_name("Vl1", false).unwrap();
+        assert_eq!(p.prefix, "Vlan");
+        assert_eq!(p.port_index, "1");
+    }
+
+    #[test]
+    fn test_parse_abbreviated_po() {
+        let p = parse_interface_name("Po1", false).unwrap();
+        assert_eq!(p.prefix, "Port-channel");
+        assert_eq!(p.port_index, "1");
+    }
+
+    // ── Mixed interface types in discovery ────────────────────────────────────
+
+    #[test]
+    fn test_discover_mixed_gig_and_tengig() {
+        // Device with GigE and TenGigE ports in the same module (like C9200CX)
+        let version = ShowVersionInfo {
+            hostname: "TEST-SW".to_string(),
+            platform: "C9200CX-12P-2X2G".to_string(),
+            software_image: "cat9k_lite.bin".to_string(),
+            serial_number: "TEST123".to_string(),
+        };
+        let inventory = vec![InventoryItem {
+            name: "Switch 1".to_string(),
+            description: "C9200CX-12P-2X2G".to_string(),
+            pid: "C9200CX-12P-2X2G".to_string(),
+            serial: "TEST123".to_string(),
+            slot: Some(0),
+        }];
+        let ibe = |name: &str| InterfaceBriefEntry {
+            name: name.to_string(),
+            ip_address: "unassigned".to_string(),
+            status: "down".to_string(),
+            protocol: "down".to_string(),
+        };
+        // show ip int brief uses abbreviated names
+        let interfaces = vec![
+            ibe("Gi1/0/1"),
+            ibe("Gi1/0/2"),
+            ibe("Gi1/1/1"),
+            ibe("Te1/1/3"),
+            ibe("Te1/1/4"),
+            ibe("Vl1"),
+        ];
+
+        let device = discover_hardware(&version, &inventory, &interfaces).unwrap();
+
+        assert!(!device.omit_slot_prefix, "multi-module should not omit slot prefix");
+        assert_eq!(device.modules.len(), 1);
+        let ports = &device.modules[0].hardware_template.ports;
+
+        // Should have 5 physical ports (2 GigE slot 0 + 1 GigE slot 1 + 2 TenGigE slot 1)
+        assert_eq!(ports.len(), 5, "expected 5 ports, got {}: {:?}",
+            ports.len(), ports.keys().collect::<Vec<_>>());
+
+        // Check that TenGigE ports are included with correct canonical prefix
+        let last_port = ports.get("Port4").expect("Port4 should exist");
+        assert_eq!(last_port.name, "TenGigabitEthernet");
+        assert_eq!(last_port.index, "1/4");
+
+        // Vlan should NOT be included
+        assert!(ports.len() == 5, "Vlan should be excluded");
     }
 }

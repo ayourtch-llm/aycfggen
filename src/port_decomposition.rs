@@ -56,10 +56,28 @@ pub fn decompose_ports(
         .iter()
         .map(|(name, lines)| {
             let normalized: Vec<String> = lines.iter().map(|l| l.trim().to_string()).collect();
+            let normalized_no_desc: Vec<String> = normalized
+                .iter()
+                .filter(|l| !l.starts_with("description "))
+                .cloned()
+                .collect();
+            let original_no_desc: Vec<String> = lines
+                .iter()
+                .filter(|l| !l.trim().starts_with("description "))
+                .cloned()
+                .collect();
+            let description_lines: Vec<String> = lines
+                .iter()
+                .filter(|l| l.trim().starts_with("description "))
+                .cloned()
+                .collect();
             PortData {
                 interface_name: name.clone(),
                 normalized_lines: normalized,
                 original_lines: lines.clone(),
+                normalized_no_desc,
+                original_no_desc,
+                description_lines,
             }
         })
         .collect();
@@ -86,15 +104,38 @@ pub fn decompose_ports(
             .or_insert_with(|| svc_name.clone());
     }
 
-    for group in groups {
+    let debug = std::env::var("AYCFG_DEBUG").is_ok();
+
+    for (gi, group) in groups.iter().enumerate() {
+        if debug {
+            eprintln!("[decompose] group {}: {} members, structural key from first member",
+                gi, group.members.len());
+            for pd in &group.members {
+                eprintln!("  {} (no_desc: {} lines, desc: {} lines)",
+                    pd.interface_name, pd.normalized_no_desc.len(), pd.description_lines.len());
+            }
+        }
         process_group(
-            &group,
+            group,
             existing_services,
             port_id_map,
             &mut result,
             &mut content_to_service,
             &mut service_counter,
+            debug,
         );
+    }
+
+    if debug {
+        eprintln!("[decompose] result: {} services, {} ports", result.services.len(), result.ports.len());
+        for svc in &result.services {
+            eprintln!("  service '{}': {} lines", svc.name, svc.port_config.lines().count());
+        }
+        for p in &result.ports {
+            eprintln!("  {} ({}) -> svc={}, prologue={}, epilogue={}",
+                p.port_id, p.interface_name, p.service_name,
+                p.prologue.is_some(), p.epilogue.is_some());
+        }
     }
 
     result
@@ -106,6 +147,12 @@ struct PortData {
     interface_name: String,
     normalized_lines: Vec<String>,
     original_lines: Vec<String>,
+    /// Normalized lines with description lines removed (for template comparison).
+    normalized_no_desc: Vec<String>,
+    /// Original lines with description lines removed (for service content).
+    original_no_desc: Vec<String>,
+    /// Original description lines (to be used as prologue).
+    description_lines: Vec<String>,
 }
 
 struct PortGroup {
@@ -158,6 +205,9 @@ fn group_by_structural_identity(ports_data: &[PortData]) -> Vec<PortGroup> {
             interface_name: pd.interface_name.clone(),
             normalized_lines: pd.normalized_lines.clone(),
             original_lines: pd.original_lines.clone(),
+            normalized_no_desc: pd.normalized_no_desc.clone(),
+            original_no_desc: pd.original_no_desc.clone(),
+            description_lines: pd.description_lines.clone(),
         });
     }
 
@@ -173,39 +223,53 @@ fn process_group(
     result: &mut DecompositionResult,
     content_to_service: &mut HashMap<String, String>,
     service_counter: &mut usize,
+    debug: bool,
 ) {
     // ── Step 3: find the most common config within the group ──────────────────
-    // Count how many ports share each normalized config signature.
+    // Use description-stripped lines for counting so that per-port descriptions
+    // don't fragment the template selection.
     let mut config_counts: HashMap<Vec<String>, usize> = HashMap::new();
     for pd in &group.members {
-        *config_counts.entry(pd.normalized_lines.clone()).or_insert(0) += 1;
+        *config_counts
+            .entry(pd.normalized_no_desc.clone())
+            .or_insert(0) += 1;
     }
 
     // The template is the config with the highest count (break ties by first seen).
-    // Track both normalized (for comparison) and original (for output) lines.
+    // Track both normalized (for comparison) and original (for output) lines —
+    // always using description-stripped versions.
     let (template_lines, template_original_lines): (Vec<String>, Vec<String>) = {
         let mut best_count = 0usize;
         let mut best_norm: Option<Vec<String>> = None;
         let mut best_orig: Option<Vec<String>> = None;
-        // Iterate in member order for stable first-seen tie-breaking.
         for pd in &group.members {
-            let count = *config_counts.get(&pd.normalized_lines).unwrap_or(&0);
+            let count = *config_counts.get(&pd.normalized_no_desc).unwrap_or(&0);
             if count > best_count {
                 best_count = count;
-                best_norm = Some(pd.normalized_lines.clone());
-                best_orig = Some(pd.original_lines.clone());
+                best_norm = Some(pd.normalized_no_desc.clone());
+                best_orig = Some(pd.original_no_desc.clone());
             }
         }
         (best_norm.unwrap_or_default(), best_orig.unwrap_or_default())
     };
 
+    if debug {
+        eprintln!("[process_group] template ({} lines, count={}):",
+            template_lines.len(),
+            config_counts.get(&template_lines).unwrap_or(&0));
+        for l in &template_lines {
+            eprintln!("    {}", l);
+        }
+    }
+
     // ── Step 4: detect deviations and handle shutdown ─────────────────────────
-    // Partition members into "matches template" and "deviations".
+    // Partition members into "matches template" and "deviations",
+    // comparing description-stripped lines.
     let mut template_members: Vec<&PortData> = Vec::new();
     let mut deviation_members: Vec<&PortData> = Vec::new();
 
     for pd in &group.members {
-        if pd.normalized_lines == template_lines {
+        if pd.normalized_no_desc == template_lines {
             template_members.push(pd);
         } else {
             deviation_members.push(pd);
@@ -213,31 +277,36 @@ fn process_group(
     }
 
     // Count deviating ports that share the identical deviation set.
-    // deviation_set = lines in port but not in template (by sorted multiset diff)
     let mut deviation_groups: HashMap<Vec<String>, Vec<&PortData>> = HashMap::new();
     for pd in &deviation_members {
-        let dev_set = compute_deviation(&template_lines, &pd.normalized_lines);
+        let dev_set = compute_deviation(&template_lines, &pd.normalized_no_desc);
         deviation_groups.entry(dev_set).or_default().push(pd);
     }
 
     // Get or create the base service for the template.
-    // Use original lines (with indentation) for the port-config content.
+    // Use original description-stripped lines for the port-config content.
     let template_port_config = lines_to_port_config(&template_original_lines);
-    let base_service_name =
-        get_or_create_service(&template_port_config, &template_lines, existing_services, content_to_service, result, service_counter);
+    let base_service_name = get_or_create_service(
+        &template_port_config,
+        &template_lines,
+        existing_services,
+        content_to_service,
+        result,
+        service_counter,
+    );
 
     // ── Assign template-matching ports ────────────────────────────────────────
     for pd in &template_members {
-        assign_port(pd, &base_service_name, None, None, port_id_map, result);
+        let desc_prologue = description_prologue(pd);
+        assign_port(pd, &base_service_name, desc_prologue, None, port_id_map, result);
     }
 
     // ── Handle deviation groups ────────────────────────────────────────────────
     for (_dev_set, dev_ports) in &deviation_groups {
         if dev_ports.len() >= 3 {
-            // Promote deviation to new service
-            // Use first member's original lines (with indentation) for the service content.
-            let full_lines = &dev_ports[0].normalized_lines;
-            let port_config = lines_to_port_config(&dev_ports[0].original_lines);
+            // Promote deviation to new service (using description-stripped content).
+            let full_lines = &dev_ports[0].normalized_no_desc;
+            let port_config = lines_to_port_config(&dev_ports[0].original_no_desc);
             let svc_name = get_or_create_service(
                 &port_config,
                 full_lines,
@@ -247,39 +316,77 @@ fn process_group(
                 service_counter,
             );
             for pd in dev_ports {
-                assign_port(pd, &svc_name, None, None, port_id_map, result);
+                let desc_prologue = description_prologue(pd);
+                assign_port(pd, &svc_name, desc_prologue, None, port_id_map, result);
             }
         } else {
             // Express as prologue/epilogue on the base service.
             for pd in dev_ports {
                 // Shutdown handling step 3: port with only "shutdown"
-                if pd.normalized_lines == vec!["shutdown".to_string()] {
-                    let shutdown_svc = get_or_create_shutdown_service(existing_services, content_to_service, result);
-                    assign_port(pd, &shutdown_svc, None, None, port_id_map, result);
+                if pd.normalized_no_desc == vec!["shutdown".to_string()] {
+                    let shutdown_svc =
+                        get_or_create_shutdown_service(existing_services, content_to_service, result);
+                    let desc_prologue = description_prologue(pd);
+                    assign_port(pd, &shutdown_svc, desc_prologue, None, port_id_map, result);
                     continue;
                 }
 
-                let (prologue, epilogue) =
-                    compute_prologue_epilogue(&template_lines, &pd.normalized_lines, &pd.original_lines);
+                let (prologue, epilogue) = compute_prologue_epilogue(
+                    &template_lines,
+                    &pd.normalized_no_desc,
+                    &pd.original_no_desc,
+                );
 
-                if prologue.is_none() && epilogue.is_none() && pd.normalized_lines != template_lines {
-                    // Unclean split — can't decompose into prologue+service+epilogue.
-                    // Create a new service for this port's full config (with original indentation).
-                    let full_config = lines_to_port_config(&pd.original_lines);
+                if prologue.is_none() && epilogue.is_none() && pd.normalized_no_desc != template_lines
+                {
+                    // Unclean split — create a new service (description-stripped).
+                    let full_config = lines_to_port_config(&pd.original_no_desc);
                     let svc_name = get_or_create_service(
                         &full_config,
-                        &pd.normalized_lines,
+                        &pd.normalized_no_desc,
                         existing_services,
                         content_to_service,
                         result,
                         service_counter,
                     );
-                    assign_port(pd, &svc_name, None, None, port_id_map, result);
+                    let desc_prologue = description_prologue(pd);
+                    assign_port(pd, &svc_name, desc_prologue, None, port_id_map, result);
                 } else {
-                    assign_port(pd, &base_service_name, prologue, epilogue, port_id_map, result);
+                    // Merge description lines into prologue.
+                    let merged_prologue = merge_description_prologue(pd, prologue);
+                    assign_port(
+                        pd,
+                        &base_service_name,
+                        merged_prologue,
+                        epilogue,
+                        port_id_map,
+                        result,
+                    );
                 }
             }
         }
+    }
+}
+
+// ─── Description-as-prologue helpers ─────────────────────────────────────────
+
+/// Build a prologue string from the port's description lines, or None if empty.
+fn description_prologue(pd: &PortData) -> Option<String> {
+    if pd.description_lines.is_empty() {
+        None
+    } else {
+        Some(pd.description_lines.join("\n"))
+    }
+}
+
+/// Merge description lines (prepended) with a computed prologue from deviation analysis.
+fn merge_description_prologue(pd: &PortData, other_prologue: Option<String>) -> Option<String> {
+    let desc = description_prologue(pd);
+    match (desc, other_prologue) {
+        (None, None) => None,
+        (Some(d), None) => Some(d),
+        (None, Some(p)) => Some(p),
+        (Some(d), Some(p)) => Some(format!("{}\n{}", d, p)),
     }
 }
 
@@ -348,7 +455,24 @@ fn get_or_create_service(
         return name.clone();
     }
     // Generate a name from structural properties.
-    let name = derive_service_name(normalized_lines, service_counter);
+    let mut name = derive_service_name(normalized_lines, service_counter);
+
+    // Resolve name collisions: if another service with a different content
+    // already uses this name, append a numeric suffix.
+    let used_names: std::collections::HashSet<&str> =
+        content_to_service.values().map(|n| n.as_str()).collect();
+    if used_names.contains(name.as_str()) {
+        let base = name.clone();
+        let mut suffix = 2;
+        loop {
+            name = format!("{}-{}", base, suffix);
+            if !used_names.contains(name.as_str()) {
+                break;
+            }
+            suffix += 1;
+        }
+    }
+
     content_to_service.insert(key, name.clone());
     result.services.push(DerivedService {
         name: name.clone(),
@@ -933,7 +1057,7 @@ mod tests {
         assert!(cg_svc_name.contains("channel-group"), "service name should contain channel-group");
     }
 
-    // ── Test 12: Unclean split — interleaved lines → new service ─────────────
+    // ── Test 12: Unclean split — interleaved non-description lines → new service
 
     #[test]
     fn test_unclean_split_creates_new_service() {
@@ -941,10 +1065,12 @@ mod tests {
         // Port: lines A, X, B, C  → X is interleaved (between A and B)
         // Per spec: if lines can't be cleanly split into prologue+service+epilogue,
         // create a new service instead.
+        // NOTE: "description" lines are always-prologue and don't cause unclean splits.
+        // Use a non-description interleaved line to test the unclean split path.
         let base_lines = &["switchport mode access", "switchport access vlan 10", "spanning-tree portfast"];
         let interleaved = &[
             "switchport mode access",
-            "description INTERLEAVED",   // inserted between line 1 and 2
+            "logging event link-status",   // inserted between line 1 and 2
             "switchport access vlan 10",
             "spanning-tree portfast",
         ];
@@ -972,5 +1098,373 @@ mod tests {
         assert!(outlier.epilogue.is_none(), "unclean split should not produce epilogue");
         // Should have its own service (2 services total: base + interleaved)
         assert_eq!(result.services.len(), 2, "unclean split creates a new service");
+    }
+
+    // ── Test 12b: Description interleaved between template lines → prologue ──
+
+    #[test]
+    fn test_description_interleaved_becomes_prologue_not_unclean_split() {
+        // Previously this would cause an unclean split; now description lines
+        // are stripped before comparison so it matches the template cleanly.
+        let base_lines = &["switchport mode access", "switchport access vlan 10", "spanning-tree portfast"];
+        let with_desc = &[
+            "switchport mode access",
+            "description INTERLEAVED",   // description between template lines
+            "switchport access vlan 10",
+            "spanning-tree portfast",
+        ];
+
+        let blocks = port_blocks(&[
+            ("GigabitEthernet0/0", base_lines),
+            ("GigabitEthernet0/1", base_lines),
+            ("GigabitEthernet0/2", base_lines),
+            ("GigabitEthernet0/3", with_desc),
+        ]);
+        let existing: HashMap<String, String> = HashMap::new();
+        let pid = pid_map(&[
+            ("GigabitEthernet0/0", "Port0"),
+            ("GigabitEthernet0/1", "Port1"),
+            ("GigabitEthernet0/2", "Port2"),
+            ("GigabitEthernet0/3", "Port3"),
+        ]);
+
+        let result = decompose_ports(&blocks, &existing, &pid);
+
+        // Only 1 service — description is extracted, remaining lines match template
+        assert_eq!(result.services.len(), 1, "description should not cause new service");
+        let outlier = result.ports.iter().find(|p| p.port_id == "Port3").unwrap();
+        assert_eq!(outlier.service_name, "access-vlan10");
+        assert!(outlier.prologue.as_deref().unwrap().contains("description INTERLEAVED"));
+        assert!(outlier.epilogue.is_none());
+    }
+
+    // ── Test 13: Description lines excluded from template, become prologue ───
+
+    #[test]
+    fn test_description_lines_become_prologue() {
+        // Trunk ports with different descriptions but same structural config.
+        // The description should NOT be baked into the service template.
+        let port_a = &[
+            "description Living Room AP",
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk native vlan 2",
+            "switchport trunk allowed vlan 1-200",
+            "switchport mode trunk",
+        ];
+        let port_b = &[
+            "description link to office",
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk native vlan 2",
+            "switchport trunk allowed vlan 1-200",
+            "switchport mode trunk",
+        ];
+        let port_c = &[
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk native vlan 2",
+            "switchport trunk allowed vlan 1-200",
+            "switchport mode trunk",
+        ];
+
+        let blocks = port_blocks(&[
+            ("GigabitEthernet0/7", port_a),
+            ("GigabitEthernet0/8", port_b),
+            ("GigabitEthernet0/9", port_c),
+        ]);
+        let existing: HashMap<String, String> = HashMap::new();
+        let pid = pid_map(&[
+            ("GigabitEthernet0/7", "Port6"),
+            ("GigabitEthernet0/8", "Port7"),
+            ("GigabitEthernet0/9", "Port8"),
+        ]);
+
+        let result = decompose_ports(&blocks, &existing, &pid);
+
+        // All 3 ports should use ONE service (descriptions excluded from template)
+        assert_eq!(result.services.len(), 1, "should have 1 service, descriptions excluded");
+        let svc = &result.services[0];
+        assert!(!svc.port_config.contains("description"), "service template must not contain description");
+
+        // Port A should have description as prologue
+        let pa = result.ports.iter().find(|p| p.port_id == "Port6").unwrap();
+        assert_eq!(pa.service_name, svc.name);
+        assert!(pa.prologue.is_some(), "Port A should have description prologue");
+        assert!(pa.prologue.as_deref().unwrap().contains("description Living Room AP"));
+
+        // Port B should have description as prologue
+        let pb = result.ports.iter().find(|p| p.port_id == "Port7").unwrap();
+        assert_eq!(pb.service_name, svc.name);
+        assert!(pb.prologue.is_some(), "Port B should have description prologue");
+        assert!(pb.prologue.as_deref().unwrap().contains("description link to office"));
+
+        // Port C (no description) should have no prologue
+        let pc = result.ports.iter().find(|p| p.port_id == "Port8").unwrap();
+        assert_eq!(pc.service_name, svc.name);
+        assert!(pc.prologue.is_none(), "Port C (no description) should have no prologue");
+    }
+
+    // ── Test 14: Description + other deviation → description as prologue ────
+
+    #[test]
+    fn test_description_with_other_epilogue_lines() {
+        // Ports with same base config but one has a description AND an extra line.
+        let base = &[
+            "switchport mode access",
+            "switchport access vlan 10",
+        ];
+        let with_desc_and_extra = &[
+            "description SPECIAL",
+            "switchport mode access",
+            "switchport access vlan 10",
+            "no cdp enable",
+        ];
+
+        let blocks = port_blocks(&[
+            ("GigabitEthernet0/0", base),
+            ("GigabitEthernet0/1", base),
+            ("GigabitEthernet0/2", base),
+            ("GigabitEthernet0/3", with_desc_and_extra),
+        ]);
+        let existing: HashMap<String, String> = HashMap::new();
+        let pid = pid_map(&[
+            ("GigabitEthernet0/0", "Port0"),
+            ("GigabitEthernet0/1", "Port1"),
+            ("GigabitEthernet0/2", "Port2"),
+            ("GigabitEthernet0/3", "Port3"),
+        ]);
+
+        let result = decompose_ports(&blocks, &existing, &pid);
+
+        // 1 service; Port3 has description as prologue and "no cdp enable" as epilogue
+        assert_eq!(result.services.len(), 1);
+        let outlier = result.ports.iter().find(|p| p.port_id == "Port3").unwrap();
+        assert!(outlier.prologue.as_deref().unwrap().contains("description SPECIAL"));
+        assert!(outlier.epilogue.as_deref().unwrap().contains("no cdp enable"));
+    }
+
+    // ── Test 15: Trunk ports with mixed native-vlan presence ────────────────
+
+    #[test]
+    fn test_trunk_ports_mixed_native_vlan() {
+        // Some trunk ports have native vlan, some don't.
+        // With descriptions stripped, the two groups should emerge.
+        let with_native = &[
+            "description AP",
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk native vlan 2",
+            "switchport trunk allowed vlan 1-200",
+            "switchport mode trunk",
+        ];
+        let without_native = &[
+            "description Uplink",
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk allowed vlan 1-200",
+            "switchport mode trunk",
+        ];
+        let without_native_no_desc = &[
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk allowed vlan 1-200",
+            "switchport mode trunk",
+        ];
+
+        let blocks = port_blocks(&[
+            ("GigabitEthernet0/3", with_native),
+            ("GigabitEthernet0/7", with_native),
+            ("GigabitEthernet0/8", without_native_no_desc),
+            ("GigabitEthernet0/9", with_native),
+            ("GigabitEthernet0/10", without_native),
+        ]);
+        let existing: HashMap<String, String> = HashMap::new();
+        let pid = pid_map(&[
+            ("GigabitEthernet0/3", "Port2"),
+            ("GigabitEthernet0/7", "Port6"),
+            ("GigabitEthernet0/8", "Port7"),
+            ("GigabitEthernet0/9", "Port8"),
+            ("GigabitEthernet0/10", "Port9"),
+        ]);
+
+        let result = decompose_ports(&blocks, &existing, &pid);
+
+        // With descriptions excluded, with_native group has 3 ports, without has 2.
+        // 3 ports with native vlan → most common → base service.
+        // 2 ports without native vlan → deviation (<3 but identical deviation).
+        // They should either get prologue/epilogue or a second service.
+        // Since "missing a template line" can't be expressed as epilogue,
+        // they should get their own service (2 identical deviations → still <3, so each
+        // gets unclean split → new service via content_to_service dedup).
+
+        // At most 2 services
+        assert!(result.services.len() <= 2, "at most 2 services for trunk ports");
+
+        // No service template should contain "description"
+        for svc in &result.services {
+            assert!(!svc.port_config.contains("description"),
+                "service template must not contain description: {}", svc.name);
+        }
+
+        // Ports with descriptions should have them as prologue
+        let p3 = result.ports.iter().find(|p| p.port_id == "Port2").unwrap();
+        assert!(p3.prologue.as_deref().unwrap_or("").contains("description AP"));
+        let p7 = result.ports.iter().find(|p| p.port_id == "Port6").unwrap();
+        assert!(p7.prologue.as_deref().unwrap_or("").contains("description AP"));
+        let p10 = result.ports.iter().find(|p| p.port_id == "Port9").unwrap();
+        assert!(p10.prologue.as_deref().unwrap_or("").contains("description Uplink"));
+
+        // Port without description should have no prologue
+        let p8 = result.ports.iter().find(|p| p.port_id == "Port7").unwrap();
+        assert!(p8.prologue.is_none(), "port without description should have no prologue");
+    }
+
+    // ── Test 16: Realistic trunk scenario — 5 ports, mixed descriptions + native vlan ─
+
+    #[test]
+    fn test_trunk_mixed_descriptions_native_vlan_and_residual_access() {
+        // 5 trunk ports with varying descriptions and native vlan settings.
+        // Tests description-as-prologue, service name dedup, and deviation handling.
+        //
+        // Config groups (after stripping descriptions):
+        //   Config A: encap + native-vlan + allowed-vlan + mode (Gi0/7, Gi0/9) → count 2
+        //   Config B: encap + allowed-vlan + mode (Gi0/8, Gi0/10) → count 2
+        //   Config C: access-vlan + encap + native-vlan + allowed-vlan + mode (Gi0/3) → count 1
+        // Tie at 2: first seen = Config A wins as template.
+        // Gi0/3 deviates with extra "access vlan 2" line → prologue
+        // Gi0/8+Gi0/10 deviate (missing native vlan) → unclean split → new service
+
+        // Use raw lines with leading space, exactly like the IOS parser produces
+        let port_blocks_raw: Vec<(String, Vec<String>)> = vec![
+            ("GigabitEthernet0/3".into(), vec![
+                " switchport access vlan 2".into(),
+                " switchport trunk encapsulation dot1q".into(),
+                " switchport trunk native vlan 2".into(),
+                " switchport trunk allowed vlan 1-200".into(),
+                " switchport mode trunk".into(),
+            ]),
+            ("GigabitEthernet0/7".into(), vec![
+                " description Floor 1 AP".into(),
+                " switchport trunk encapsulation dot1q".into(),
+                " switchport trunk native vlan 2".into(),
+                " switchport trunk allowed vlan 1-200".into(),
+                " switchport mode trunk".into(),
+            ]),
+            ("GigabitEthernet0/8".into(), vec![
+                " switchport trunk encapsulation dot1q".into(),
+                " switchport trunk allowed vlan 1-200".into(),
+                " switchport mode trunk".into(),
+            ]),
+            ("GigabitEthernet0/9".into(), vec![
+                " description Floor 2 uplink".into(),
+                " switchport trunk encapsulation dot1q".into(),
+                " switchport trunk native vlan 2".into(),
+                " switchport trunk allowed vlan 1-200".into(),
+                " switchport mode trunk".into(),
+            ]),
+            ("GigabitEthernet0/10".into(), vec![
+                " description Floor 3 uplink".into(),
+                " switchport trunk encapsulation dot1q".into(),
+                " switchport trunk allowed vlan 1-200".into(),
+                " switchport mode trunk".into(),
+            ]),
+        ];
+        let existing: HashMap<String, String> = HashMap::new();
+        let pid = pid_map(&[
+            ("GigabitEthernet0/3", "Port2"),
+            ("GigabitEthernet0/7", "Port6"),
+            ("GigabitEthernet0/8", "Port7"),
+            ("GigabitEthernet0/9", "Port8"),
+            ("GigabitEthernet0/10", "Port9"),
+        ]);
+
+        let result = decompose_ports(&port_blocks_raw, &existing, &pid);
+
+        // No service should contain description lines
+        for svc in &result.services {
+            assert!(!svc.port_config.contains("description"),
+                "service '{}' must not contain description line", svc.name);
+        }
+
+        // Exactly 2 services: trunk with native vlan (template) + trunk without
+        assert_eq!(result.services.len(), 2,
+            "expected 2 services, got {}: {:?}",
+            result.services.len(),
+            result.services.iter().map(|s| &s.name).collect::<Vec<_>>());
+
+        // Service names should be unique (dedup fix)
+        assert_ne!(result.services[0].name, result.services[1].name,
+            "service names must be unique");
+
+        // Template service should have native vlan
+        let template_svc = &result.services[0];
+        assert!(template_svc.port_config.contains("native vlan"),
+            "template service should contain native vlan");
+
+        // Second service should NOT have native vlan
+        let second_svc = &result.services[1];
+        assert!(!second_svc.port_config.contains("native vlan"),
+            "second service should not contain native vlan");
+
+        // Description ports should have descriptions as prologue
+        let p7 = result.ports.iter().find(|p| p.port_id == "Port6").unwrap();
+        assert!(p7.prologue.as_deref().unwrap_or("").contains("description Floor 1 AP"));
+
+        let p9 = result.ports.iter().find(|p| p.port_id == "Port8").unwrap();
+        assert!(p9.prologue.as_deref().unwrap_or("").contains("description Floor 2 uplink"));
+
+        let p10 = result.ports.iter().find(|p| p.port_id == "Port9").unwrap();
+        assert!(p10.prologue.as_deref().unwrap_or("").contains("description Floor 3 uplink"));
+
+        // Gi0/3 should have "access vlan 2" as prologue (residual line on trunk port)
+        let p3 = result.ports.iter().find(|p| p.port_id == "Port2").unwrap();
+        assert!(p3.prologue.as_deref().unwrap_or("").contains("switchport access vlan 2"),
+            "Gi0/3 should have residual access vlan as prologue");
+
+        // Gi0/8 has no description → no description in prologue
+        let p8 = result.ports.iter().find(|p| p.port_id == "Port7").unwrap();
+        if let Some(ref pro) = p8.prologue {
+            assert!(!pro.contains("description"), "Gi0/8 has no description");
+        }
+    }
+
+    // ── Test 17: Service name collision → unique suffix ─────────────────────
+
+    #[test]
+    fn test_service_name_dedup_on_collision() {
+        // Two groups that would both derive "trunk-vlan1-100" but have different content.
+        // The second should get a "-2" suffix.
+        let group_a = &[
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk native vlan 5",
+            "switchport trunk allowed vlan 1-100",
+            "switchport mode trunk",
+        ];
+        let group_b = &[
+            "switchport trunk encapsulation dot1q",
+            "switchport trunk allowed vlan 1-100",
+            "switchport mode trunk",
+        ];
+
+        let blocks = port_blocks(&[
+            ("GigabitEthernet0/1", group_a),
+            ("GigabitEthernet0/2", group_a),
+            ("GigabitEthernet0/3", group_a),
+            ("GigabitEthernet0/4", group_b),
+            ("GigabitEthernet0/5", group_b),
+            ("GigabitEthernet0/6", group_b),
+        ]);
+        let existing: HashMap<String, String> = HashMap::new();
+        let pid = pid_map(&[
+            ("GigabitEthernet0/1", "Port0"),
+            ("GigabitEthernet0/2", "Port1"),
+            ("GigabitEthernet0/3", "Port2"),
+            ("GigabitEthernet0/4", "Port3"),
+            ("GigabitEthernet0/5", "Port4"),
+            ("GigabitEthernet0/6", "Port5"),
+        ]);
+
+        let result = decompose_ports(&blocks, &existing, &pid);
+
+        assert_eq!(result.services.len(), 2, "should have 2 services");
+        let names: Vec<&str> = result.services.iter().map(|s| s.name.as_str()).collect();
+        // Both derive "trunk-vlan1-100" but second must be uniquified
+        assert!(names.contains(&"trunk-vlan1-100"), "first service should be trunk-vlan1-100");
+        assert!(names.contains(&"trunk-vlan1-100-2"), "second service should be trunk-vlan1-100-2");
     }
 }

@@ -251,9 +251,15 @@ fn split_command_dump(content: &str) -> HashMap<String, String> {
     for line in content.lines() {
         // Try to detect a command line
         if let Some(cmd) = detect_command_line(line) {
-            // Flush previous section
+            // Flush previous section — only if it has non-empty content.
+            // Empty sections occur when the user types partial/cancelled commands
+            // (tab completion, typos) that produce consecutive prompt lines.
             if let Some(prev_cmd) = current_cmd.take() {
-                sections.insert(prev_cmd, current_lines.join("\n"));
+                let content_text = current_lines.join("\n");
+                let has_content = content_text.lines().any(|l| !l.trim().is_empty());
+                if has_content {
+                    sections.insert(prev_cmd, content_text);
+                }
                 current_lines.clear();
             }
             current_cmd = Some(cmd);
@@ -264,7 +270,11 @@ fn split_command_dump(content: &str) -> HashMap<String, String> {
 
     // Flush last section
     if let Some(cmd) = current_cmd {
-        sections.insert(cmd, current_lines.join("\n"));
+        let content_text = current_lines.join("\n");
+        let has_content = content_text.lines().any(|l| !l.trim().is_empty());
+        if has_content {
+            sections.insert(cmd, content_text);
+        }
     }
 
     sections
@@ -285,22 +295,59 @@ fn detect_command_line(line: &str) -> Option<String> {
     for sep in ['#', '>'] {
         if let Some(pos) = trimmed.find(sep) {
             let after_prompt = trimmed[pos + 1..].trim();
-            for &known in KNOWN_COMMANDS {
-                if after_prompt.eq_ignore_ascii_case(known) {
-                    return Some(known.to_string());
-                }
+            if let Some(cmd) = match_command(after_prompt) {
+                return Some(cmd);
             }
         }
     }
 
     // Format 3: bare command on a line by itself
+    if let Some(cmd) = match_command(trimmed) {
+        return Some(cmd);
+    }
+
+    None
+}
+
+/// Match a command string against known commands.
+/// Supports both exact match and IOS-style abbreviation (each word is a prefix of the
+/// corresponding word in the full command, e.g. "sh ip int bri" matches "show ip interface brief").
+fn match_command(input: &str) -> Option<String> {
+    let input_lower = input.to_ascii_lowercase();
+
+    // Try exact match first
     for &known in KNOWN_COMMANDS {
-        if trimmed.eq_ignore_ascii_case(known) {
+        if input_lower == known {
             return Some(known.to_string());
         }
     }
 
-    None
+    // Try abbreviation matching: each input word must be a prefix of the corresponding
+    // known command word, and all known command words must be accounted for.
+    let input_words: Vec<&str> = input_lower.split_whitespace().collect();
+    if input_words.is_empty() {
+        return None;
+    }
+
+    let mut best_match: Option<&str> = None;
+    for &known in KNOWN_COMMANDS {
+        let known_words: Vec<&str> = known.split_whitespace().collect();
+        if input_words.len() != known_words.len() {
+            continue;
+        }
+        let all_match = input_words
+            .iter()
+            .zip(known_words.iter())
+            .all(|(inp, kw)| kw.starts_with(*inp));
+        if all_match {
+            // Prefer exact match over abbreviation, but accept first abbreviation match
+            if best_match.is_none() {
+                best_match = Some(known);
+            }
+        }
+    }
+
+    best_match.map(|s| s.to_string())
 }
 
 // ─── run_extract_live ────────────────────────────────────────────────────────
@@ -544,5 +591,92 @@ mod tests {
         ]).unwrap();
         assert!(args.recreate_hardware_profiles);
         assert_eq!(args.save_commands, Some(PathBuf::from("/tmp/dump.txt")));
+    }
+
+    // ── match_command / detect_command_line ──────────────────────────────────
+
+    #[test]
+    fn test_match_command_exact() {
+        assert_eq!(match_command("show version"), Some("show version".into()));
+        assert_eq!(match_command("show ip interface brief"), Some("show ip interface brief".into()));
+    }
+
+    #[test]
+    fn test_match_command_abbreviated() {
+        assert_eq!(match_command("sh ver"), Some("show version".into()));
+        assert_eq!(match_command("show ip int bri"), Some("show ip interface brief".into()));
+        assert_eq!(match_command("sh ip int br"), Some("show ip interface brief".into()));
+        assert_eq!(match_command("sh inven"), Some("show inventory".into()));
+        assert_eq!(match_command("show run"), Some("show running-config".into()));
+        assert_eq!(match_command("sh int stat"), Some("show interfaces status".into()));
+    }
+
+    #[test]
+    fn test_match_command_no_match() {
+        assert_eq!(match_command("show"), None);
+        assert_eq!(match_command("term len 0"), None);
+        assert_eq!(match_command("exit"), None);
+        assert_eq!(match_command(""), None);
+    }
+
+    #[test]
+    fn test_detect_command_line_with_prompt_abbreviated() {
+        assert_eq!(
+            detect_command_line("SWITCH-01#sh ip int bri"),
+            Some("show ip interface brief".into())
+        );
+        assert_eq!(
+            detect_command_line("SWITCH-01#show inven"),
+            Some("show inventory".into())
+        );
+        assert_eq!(
+            detect_command_line("SWITCH-01#show ver"),
+            Some("show version".into())
+        );
+    }
+
+    #[test]
+    fn test_detect_command_line_partial_word_not_matched() {
+        // "show" alone doesn't match any 2-word command
+        assert_eq!(detect_command_line("SWITCH#show"), None);
+        // "show in" matches "show inventory" (2 words, prefix match)
+        assert_eq!(
+            detect_command_line("SWITCH#show in"),
+            Some("show inventory".into())
+        );
+    }
+
+    #[test]
+    fn test_split_command_dump_with_abbreviated_commands() {
+        let dump = "\
+SWITCH#term len 0
+SWITCH#sh ver
+Cisco IOS Software version 15.2
+SWITCH#sh inven
+NAME: \"1\", DESCR: \"Switch\"
+PID: WS-C3560CG , SN: ABC123
+SWITCH#sh ip int bri
+Interface      IP-Address
+Gi0/1          unassigned
+SWITCH#sh int stat
+Port   Name   Status
+Gi0/1         connected
+SWITCH#sh run
+Building configuration...
+hostname SWITCH
+!
+end
+";
+        let sections = split_command_dump(dump);
+        assert!(sections.contains_key("show version"), "should have show version");
+        assert!(sections.contains_key("show inventory"), "should have show inventory");
+        assert!(sections.contains_key("show ip interface brief"), "should have show ip interface brief");
+        assert!(sections.contains_key("show interfaces status"), "should have show interfaces status");
+        assert!(sections.contains_key("show running-config"), "should have show running-config");
+
+        // show ip interface brief should contain the interface table, not the status table
+        let ip_brief = sections.get("show ip interface brief").unwrap();
+        assert!(ip_brief.contains("IP-Address"), "should contain IP-Address header");
+        assert!(!ip_brief.contains("Status"), "should not contain status table header");
     }
 }

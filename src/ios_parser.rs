@@ -101,35 +101,46 @@ pub fn parse_running_config(input: &str) -> Vec<ConfigBlock> {
 
         // Check for multi-line banner construct
         if let Some(rest) = line.strip_prefix("banner ") {
-            // rest is like "motd ^C..." or "login ^"
+            // rest is like "motd ^C..." or "login #"
             // The keyword is the word after "banner " and before the delimiter
             let mut parts = rest.splitn(2, ' ');
             let banner_type = parts.next().unwrap_or("").trim();
             let after_type = parts.next().unwrap_or("").trim();
 
-            // The delimiter is the first character of the remainder
-            if let Some(delim_char) = after_type.chars().next() {
+            if !after_type.is_empty() {
                 let keyword = format!("banner {}", banner_type);
                 let mut content = line.to_string();
                 content.push('\n');
 
+                // Determine the delimiter string.
+                // IOS uses the first character after the space as the delimiter.
+                // Special case: ^C (caret + C) is a common two-char delimiter.
+                let delim = if after_type.starts_with("^C") {
+                    "^C"
+                } else if after_type.starts_with("\x03") {
+                    "\x03"
+                } else {
+                    &after_type[..after_type.chars().next().unwrap().len_utf8()]
+                };
+
                 // Check if the closing delimiter is already on this line (after the opening)
-                let after_delim = &after_type[delim_char.len_utf8()..];
-                if after_delim.contains(delim_char) {
+                let after_opening = &after_type[delim.len()..];
+                if after_opening.contains(delim) {
                     // Single-line banner
                     flush_global(&mut global_lines, &mut blocks);
                     blocks.push(ConfigBlock::MultiLineConstruct { keyword, content });
                     continue;
                 }
 
-                // Multi-line: collect until we see the delimiter on its own or as part of a line
+                // Multi-line: collect until we see a line that is exactly the delimiter
+                // or contains the delimiter string
                 loop {
                     match iter.next() {
                         None => break,
                         Some(next_line) => {
                             content.push_str(next_line);
                             content.push('\n');
-                            if next_line.contains(delim_char) {
+                            if next_line.trim() == delim || next_line.ends_with(delim) {
                                 break;
                             }
                         }
@@ -143,22 +154,24 @@ pub fn parse_running_config(input: &str) -> Vec<ConfigBlock> {
             // Fall through if no delimiter found — treat as global
         }
 
-        // Check for crypto pki certificate chain or certificate blocks
-        if line.starts_with("crypto pki certificate chain ")
-            || (line.starts_with(' ') && line.trim_start().starts_with("certificate "))
-        {
+        // Check for crypto pki certificate chain blocks.
+        // Collect the entire chain including all sub-certificates until the
+        // final un-indented line or end of the chain section.
+        if line.starts_with("crypto pki certificate chain ") {
             let keyword = line.trim().to_string();
             let mut content = line.to_string();
             content.push('\n');
 
-            // Collect until `quit`
+            // Collect all indented lines (certificates, data, quit lines)
+            // The chain ends when we hit a non-indented line.
             loop {
-                match iter.next() {
+                match iter.peek() {
                     None => break,
                     Some(next_line) => {
-                        content.push_str(next_line);
-                        content.push('\n');
-                        if next_line.trim() == "quit" {
+                        if next_line.starts_with(' ') || next_line.trim() == "quit" {
+                            content.push_str(iter.next().unwrap());
+                            content.push('\n');
+                        } else {
                             break;
                         }
                     }
@@ -788,5 +801,124 @@ interface GigabitEthernet2/0/1
         let blocks = parse_running_config(config);
         let names = physical_names(&blocks);
         assert_eq!(names, vec!["GigabitEthernet1/0/3", "GigabitEthernet2/0/1"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: banner with ^C delimiter (most common IOS delimiter)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_banner_motd_caret_c_delimiter() {
+        let config = "\
+banner motd ^C
+Unauthorized access prohibited.
+Contact admin@example.com for access.
+^C
+hostname router1
+";
+        let blocks = parse_running_config(config);
+        let keywords = multiline_keywords(&blocks);
+        assert!(keywords.contains(&"banner motd"), "should have banner motd block");
+        let content = get_multiline_content(&blocks, "banner motd").expect("banner motd found");
+        assert!(content.contains("Unauthorized access prohibited."), "banner body captured");
+        assert!(content.contains("Contact admin@example.com"), "full banner body captured");
+        // Verify router1 is in global config, not in the banner
+        let globals = global_lines_all(&blocks);
+        assert!(globals.contains(&"hostname router1"), "hostname should be global, not in banner");
+    }
+
+    #[test]
+    fn test_banner_motd_hash_delimiter() {
+        let config = "\
+banner motd #
+Welcome to the network.
+#
+";
+        let blocks = parse_running_config(config);
+        let content = get_multiline_content(&blocks, "banner motd").expect("banner found");
+        assert!(content.contains("Welcome to the network."));
+    }
+
+    #[test]
+    fn test_banner_motd_caret_c_single_line() {
+        let config = "banner motd ^CNo access^C\n";
+        let blocks = parse_running_config(config);
+        let keywords = multiline_keywords(&blocks);
+        assert_eq!(keywords, vec!["banner motd"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: multi-cert chain (multiple quit blocks)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_crypto_pki_multi_certificate_chain() {
+        let config = "\
+crypto pki certificate chain MyCA
+ certificate ca 01
+  AABBCCDD
+  quit
+ certificate 02
+  EEFF0011
+  quit
+!
+hostname router1
+";
+        let blocks = parse_running_config(config);
+        let content = get_multiline_content(&blocks, "crypto pki certificate chain MyCA")
+            .expect("crypto pki block found");
+        assert!(content.contains("AABBCCDD"), "first cert data captured");
+        assert!(content.contains("EEFF0011"), "second cert data captured");
+        assert!(content.contains("certificate 02"), "second certificate header captured");
+        // Verify hostname is not consumed by the cert block
+        let globals = global_lines_all(&blocks);
+        assert!(globals.contains(&"hostname router1"), "hostname should be global");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: interface blocks without ! separator
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_interfaces_without_bang_separator() {
+        let config = "\
+interface GigabitEthernet0/0
+ ip address 10.0.0.1 255.255.255.0
+interface GigabitEthernet0/1
+ ip address 10.0.1.1 255.255.255.0
+";
+        let blocks = parse_running_config(config);
+        let names = physical_names(&blocks);
+        assert_eq!(names, vec!["GigabitEthernet0/0", "GigabitEthernet0/1"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: unknown interface type falls back to VirtualInterface
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unknown_interface_type_fallback() {
+        let config = "\
+interface BDI1
+ ip address 10.0.0.1 255.255.255.0
+!
+";
+        let blocks = parse_running_config(config);
+        assert_eq!(virtual_names(&blocks), vec!["BDI1"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: Serial sub-interface
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_serial_sub_interface() {
+        let config = "\
+interface Serial0/0/0.1
+ encapsulation ppp
+!
+";
+        let blocks = parse_running_config(config);
+        assert_eq!(sub_interface_names(&blocks), vec!["Serial0/0/0.1"]);
     }
 }

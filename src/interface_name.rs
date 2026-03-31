@@ -39,6 +39,18 @@ pub fn derive_interface_name_for_port_id(
         None => (port_id, ""),
     };
 
+    // Validate sub-interface suffix if present: must be ".<digits>" with at least one digit
+    if !suffix.is_empty() {
+        let digits = &suffix[1..]; // skip the '.'
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!(
+                "invalid sub-interface suffix {:?} in port id {:?} (expected .<digits>)",
+                suffix,
+                port_id
+            );
+        }
+    }
+
     let port_def = hw_template.ports.get(parent_id)
         .ok_or_else(|| anyhow::anyhow!(
             "port {:?} not found in hardware template",
@@ -134,6 +146,27 @@ mod tests {
         let hw = make_hw_template(&[("Port0", "GigabitEthernet", "0/0")]);
         let result = derive_interface_name_for_port_id("Port99.100", &hw, 0, 0, true);
         assert!(result.is_err(), "unknown parent port should return an error");
+    }
+
+    #[test]
+    fn test_sub_iface_trailing_dot_returns_error() {
+        let hw = make_hw_template(&[("Port0", "GigabitEthernet", "0/0")]);
+        let result = derive_interface_name_for_port_id("Port0.", &hw, 0, 0, true);
+        assert!(result.is_err(), "trailing dot with no digits should return an error");
+    }
+
+    #[test]
+    fn test_sub_iface_nested_dots_returns_error() {
+        let hw = make_hw_template(&[("Port0", "GigabitEthernet", "0/0")]);
+        let result = derive_interface_name_for_port_id("Port0.100.200", &hw, 0, 0, true);
+        assert!(result.is_err(), "nested dots should return an error");
+    }
+
+    #[test]
+    fn test_sub_iface_non_numeric_suffix_returns_error() {
+        let hw = make_hw_template(&[("Port0", "GigabitEthernet", "0/0")]);
+        let result = derive_interface_name_for_port_id("Port0.abc", &hw, 0, 0, true);
+        assert!(result.is_err(), "non-numeric suffix should return an error");
     }
 
     #[test]

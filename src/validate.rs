@@ -96,8 +96,13 @@ pub fn validate_device(
 
         // Check each port assignment
         for port_assignment in &module.ports {
-            // Port name must exist in hardware template
-            if !hw_template.ports.contains_key(&port_assignment.name) {
+            // Port name must exist in hardware template.
+            // Sub-interface port IDs (e.g., "Port0.100") reference their parent port.
+            let parent_port_name = match port_assignment.name.find('.') {
+                Some(dot_pos) => &port_assignment.name[..dot_pos],
+                None => &port_assignment.name,
+            };
+            if !hw_template.ports.contains_key(parent_port_name) {
                 anyhow::bail!(
                     "device '{}': port '{}' not found in hardware template for SKU '{}'",
                     device_name,

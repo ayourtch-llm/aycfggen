@@ -312,6 +312,67 @@ fn run_extract_sections(
         }
     }
 
+    // Second pass: check services the device REUSES for SVI conflicts.
+    // A shared service (created by another device) may have an SVI on disk for a VLAN
+    // that this device also has — but with different content. We need standalone overrides.
+    //
+    // Build a map of this device's VLANs → expected SVI content from extraction output.
+    let device_svi_by_vlan: HashMap<u16, &str> = output.svi_assignments.iter()
+        .map(|a| (a.vlan, a.svi_config.as_str()))
+        .collect();
+
+    // Collect all unique port-assignment service names
+    let mut port_services: Vec<String> = Vec::new();
+    {
+        let mut seen = std::collections::HashSet::new();
+        for module_opt in &output.device_config.modules {
+            if let Some(module) = module_opt {
+                for port in &module.ports {
+                    if seen.insert(port.service.clone()) {
+                        port_services.push(port.service.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    for svc_name in &port_services {
+        // Skip services that already have an SVI assignment from this device
+        // (already handled in the first pass above)
+        if output.svi_assignments.iter().any(|a| &a.service_name == svc_name) {
+            continue;
+        }
+        // Check if this shared service has an SVI on disk
+        if let Some(disk_svi) = svc_source_for_svi.load_svi_config(svc_name).unwrap_or(None) {
+            // Parse the VLAN number from the on-disk SVI
+            if let Some(vlan_line) = disk_svi.lines().next() {
+                if let Some(vlan_str) = vlan_line.trim().strip_prefix("interface Vlan") {
+                    if let Ok(vlan_num) = vlan_str.parse::<u16>() {
+                        // Does this device have its own SVI for this VLAN?
+                        if let Some(device_svi) = device_svi_by_vlan.get(&vlan_num) {
+                            if disk_svi.trim() != device_svi.trim() {
+                                // Conflict: shared service has wrong SVI for this device
+                                let standalone_name = format!("svi-{}-vlan{}", output.device.serial_number, vlan_num);
+                                if !extra_svi_services.contains(&standalone_name) {
+                                    eprintln!(
+                                        "  SVI override for service '{}' vlan {}: creating standalone '{}'",
+                                        svc_name, vlan_num, standalone_name
+                                    );
+                                    service_sink.write_port_config(&standalone_name, "")?;
+                                    service_sink.write_svi_config(&standalone_name, device_svi)?;
+                                    service_sink.write_service_vars(&standalone_name, &crate::model::ServiceVars {
+                                        vlan: Some(vlan_num as u32),
+                                    })?;
+                                    extra_svi_services.push(standalone_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // If we created any standalone SVI services due to conflicts, update the device config
     let mut device_config = output.device_config.clone();
     if !extra_svi_services.is_empty() {

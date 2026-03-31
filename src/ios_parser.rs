@@ -94,8 +94,9 @@ pub fn parse_running_config(input: &str) -> Vec<ConfigBlock> {
     let mut iter = input.lines().peekable();
 
     while let Some(line) = iter.next() {
-        // Skip bare `!` separator lines
-        if line.trim() == "!" {
+        // Skip bare `!` separator lines (unindented only).
+        // Space-prefixed ` !` inside VRF/route-map blocks is meaningful content.
+        if line.trim_end() == "!" {
             continue;
         }
 

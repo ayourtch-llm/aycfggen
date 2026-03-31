@@ -279,7 +279,9 @@ fn find_match_lines(flat_lines: &[FlatLine], pattern: &[String]) -> Option<(usiz
 }
 
 fn is_bare_bang(line: &str) -> bool {
-    line.trim() == "!"
+    // Only match unindented `!` lines (optionally with trailing whitespace).
+    // Space-prefixed ` !` inside VRF/route-map blocks is meaningful config content.
+    line.trim_end() == "!"
 }
 
 /// Render a slice of flat lines (from a Config section) into the template output.

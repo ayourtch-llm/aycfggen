@@ -106,7 +106,10 @@ pub fn build_port_block(
             }
 
             // port-config.txt content (already normalized to end with \n)
-            output.push_str(&port_config);
+            // Skip if the config is empty/whitespace-only (e.g. shutdown-only ports)
+            if !port_config.trim().is_empty() {
+                output.push_str(&port_config);
+            }
 
             // epilogue lines (split on \n, skip trailing empty line)
             if let Some(epilogue) = &port_assignment.epilogue {
@@ -171,6 +174,10 @@ pub fn build_svi_block(
 
     // Sort by (type_priority, number) — Loopback before Vlan, then by number.
     svi_entries.sort_by_key(|(key, _)| *key);
+
+    // Deduplicate by sort key — if multiple services provide the same SVI
+    // (e.g., two services both have interface Vlan80), keep only the first.
+    svi_entries.dedup_by_key(|(key, _)| *key);
 
     let mut output = String::new();
     for ((_prio, _num), content) in &svi_entries {

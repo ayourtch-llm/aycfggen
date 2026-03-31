@@ -332,15 +332,6 @@ fn lines_to_port_config(lines: &[String]) -> String {
     s
 }
 
-/// Convert normalized (trimmed) lines to port-config.txt string.
-fn normalized_to_port_config(lines: &[String]) -> String {
-    let mut s = String::new();
-    for line in lines {
-        s.push_str(line);
-        s.push('\n');
-    }
-    s
-}
 
 /// Get an existing service for this content, or create a new one.
 fn get_or_create_service(

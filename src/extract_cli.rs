@@ -46,6 +46,10 @@ pub struct ExtractArgs {
     /// Override save location for collected command output
     #[arg(long)]
     pub save_commands: Option<PathBuf>,
+
+    /// After extraction, compile each device and verify round-trip against original config
+    #[arg(long)]
+    pub round_trip: bool,
 }
 
 // ─── ResolvedExtractDirs ──────────────────────────────────────────────────────
@@ -114,6 +118,7 @@ pub fn run_extract_offline(
     dirs: &ResolvedExtractDirs,
     save_commands_path: Option<&std::path::Path>,
     recreate_hw: bool,
+    round_trip: bool,
 ) -> Result<()> {
     // Read the entire command dump
     let content = std::fs::read_to_string(file_path)
@@ -134,7 +139,7 @@ pub fn run_extract_offline(
 
     if per_device.is_empty() {
         // No commands detected at all — try single-device fallback with raw content
-        return run_extract_sections(&content, &HashMap::new(), dirs, recreate_hw);
+        return run_extract_sections(&content, &HashMap::new(), dirs, recreate_hw, round_trip);
     }
 
     let device_count = per_device.len();
@@ -163,7 +168,7 @@ pub fn run_extract_offline(
         if device_count > 1 {
             eprintln!("Processing device: {}", hostname);
         }
-        run_extract_sections(&content, sections, dirs, recreate_hw)?;
+        run_extract_sections(&content, sections, dirs, recreate_hw, round_trip)?;
     }
 
     Ok(())
@@ -175,6 +180,7 @@ fn run_extract_sections(
     sections: &HashMap<String, String>,
     dirs: &ResolvedExtractDirs,
     recreate_hw: bool,
+    round_trip: bool,
 ) -> Result<()> {
     use crate::extract::extract_device;
     use crate::fs_sinks::{
@@ -283,6 +289,80 @@ fn run_extract_sections(
     println!("  New config elements: {}", output.new_elements.len());
     println!("  Template: {}", output.template_name);
     println!("  Logical device written to: {}/config.json", output.device.serial_number);
+
+    // ── Round-trip verification ──────────────────────────────────────────────
+    if round_trip {
+        use crate::compile::compile_device;
+        use crate::fs_sources::{
+            FsHardwareTemplateSource, FsServiceSource as FsServiceSourceCompile,
+            FsConfigTemplateSource, FsConfigElementSource as FsConfigElementSourceCompile,
+            FsLogicalDeviceSource, FsSoftwareImageSource,
+        };
+        use crate::round_trip::verify_round_trip;
+
+        let serial = &output.device.serial_number;
+
+        // Ensure a stub software image exists so compilation doesn't fail on that
+        if !output.device.software_image.is_empty() {
+            let sw_dir = dirs.configs.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("software-images");
+            // Try the sibling of configs dir first, fall back to config_root-level
+            let sw_path = if sw_dir.exists() || dirs.configs.parent().is_some() {
+                sw_dir
+            } else {
+                PathBuf::from("software-images")
+            };
+            let _ = std::fs::create_dir_all(&sw_path);
+            let img_file = sw_path.join(&output.device.software_image);
+            if !img_file.exists() {
+                let _ = std::fs::write(&img_file, b"stub");
+            }
+        }
+
+        // Locate the software-images directory relative to config root
+        let config_root = dirs.hardware_templates.parent()
+            .unwrap_or(std::path::Path::new("."));
+        let sw_images_dir = config_root.join("software-images");
+        let _ = std::fs::create_dir_all(&sw_images_dir);
+        if !output.device.software_image.is_empty() {
+            let img_file = sw_images_dir.join(&output.device.software_image);
+            if !img_file.exists() {
+                let _ = std::fs::write(&img_file, b"stub");
+            }
+        }
+
+        let hw_source = FsHardwareTemplateSource::new(dirs.hardware_templates.clone());
+        let svc_source = FsServiceSourceCompile::new(dirs.services.clone());
+        let tmpl_source = FsConfigTemplateSource::new(dirs.config_templates.clone());
+        let elem_source = FsConfigElementSourceCompile::new(dirs.config_elements.clone());
+        let dev_source = FsLogicalDeviceSource::new(dirs.logical_devices.clone());
+        let img_source = FsSoftwareImageSource::new(sw_images_dir);
+
+        match compile_device(serial, &dev_source, &hw_source, &svc_source, &tmpl_source, &elem_source, &img_source) {
+            Ok(compiled) => {
+                match verify_round_trip(show_running_config, &compiled) {
+                    Ok(()) => {
+                        println!("  Round-trip: PASS");
+                    }
+                    Err(diff) => {
+                        println!("  Round-trip: FAIL");
+                        // Print first few diff lines for context
+                        for line in diff.lines().take(10) {
+                            println!("    {}", line);
+                        }
+                        let total_lines = diff.lines().count();
+                        if total_lines > 10 {
+                            println!("    ... ({} more lines)", total_lines - 10);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("  Round-trip: COMPILE ERROR: {:#}", e);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -477,6 +557,7 @@ pub fn run_extract_live(
     dirs: &ResolvedExtractDirs,
     save_commands_path: Option<&std::path::Path>,
     recreate_hw: bool,
+    round_trip: bool,
 ) -> Result<()> {
     let username = std::env::var("AYCFGEXTRACT_SSH_USERNAME")
         .map_err(|_| anyhow::anyhow!("AYCFGEXTRACT_SSH_USERNAME environment variable not set"))?;
@@ -515,7 +596,7 @@ pub fn run_extract_live(
     eprintln!("Command output saved to: {}", save_path.display());
 
     // Now run the offline extraction on the saved file
-    run_extract_offline(save_path, dirs, None, recreate_hw)
+    run_extract_offline(save_path, dirs, None, recreate_hw, round_trip)
 }
 
 /// Connect to a device via SSH and collect all extraction commands.

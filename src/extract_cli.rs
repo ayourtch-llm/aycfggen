@@ -272,6 +272,7 @@ fn run_extract_sections(
     // per-device standalone SVI service instead to avoid cross-device conflicts.
     let svc_source_for_svi = FsServiceSource::new(dirs.services.clone());
     let mut extra_svi_services: Vec<String> = Vec::new();
+    let mut replaced_svi_services: std::collections::HashSet<String> = std::collections::HashSet::new();
     for svi_assignment in &output.svi_assignments {
         let svi_vlan = svi_assignment.vlan as u32;
 
@@ -299,6 +300,7 @@ fn run_extract_sections(
             service_sink.write_service_vars(&standalone_name, &crate::model::ServiceVars {
                 vlan: Some(svi_vlan),
             })?;
+            replaced_svi_services.insert(svi_assignment.service_name.clone());
             extra_svi_services.push(standalone_name);
         } else {
             // Write the SVI to the shared service (first writer wins, or identical)
@@ -373,9 +375,12 @@ fn run_extract_sections(
         }
     }
 
-    // If we created any standalone SVI services due to conflicts, update the device config
+    // Update the device config: replace conflicting services with standalones
     let mut device_config = output.device_config.clone();
-    if !extra_svi_services.is_empty() {
+    if !extra_svi_services.is_empty() || !replaced_svi_services.is_empty() {
+        // Remove services that were replaced by standalones
+        device_config.svi_services.retain(|s| !replaced_svi_services.contains(s));
+        // Add the standalone replacements
         device_config.svi_services.extend(extra_svi_services);
     }
 

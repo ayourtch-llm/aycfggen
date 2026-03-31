@@ -128,34 +128,19 @@ pub fn build_port_block(
 
 /// Build the SVI configuration block for a logical device.
 ///
-/// Collects unique service names (first-occurrence order) across all ports,
-/// then for each service that has an svi-config.txt, includes its content.
+/// Uses only the services listed in `config.svi_services` — this is the
+/// authoritative list of which services should contribute SVIs for this device.
 /// The content does NOT include `! SVI-START` / `! SVI-END` markers.
 pub fn build_svi_block(
     config: &LogicalDeviceConfig,
     service_source: &dyn ServiceSource,
 ) -> Result<String> {
-    // Collect services relevant to THIS device: svi_services + port-assignment services.
-    // Standalone SVI services come first so they take precedence over shared services
-    // when deduplicating by VLAN number (device-specific SVIs override shared ones).
     let mut relevant_services: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    // Standalone SVI services listed in config.json (take precedence)
     for svc in &config.svi_services {
         if seen.insert(svc.clone()) {
             relevant_services.push(svc.clone());
-        }
-    }
-
-    // Services from port assignments (in first-occurrence order)
-    for module_opt in &config.modules {
-        if let Some(module) = module_opt {
-            for port in &module.ports {
-                if seen.insert(port.service.clone()) {
-                    relevant_services.push(port.service.clone());
-                }
-            }
         }
     }
 
@@ -918,7 +903,7 @@ mod tests {
             omit_slot_prefix: false,
             slot_index_base: None,
             vars: IndexMap::new(),
-            svi_services: vec![],
+            svi_services: vec!["my-service".to_string()],
             modules: vec![Some(module)],
         };
 
@@ -1385,7 +1370,7 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: device_vars,
-            svi_services: vec![],
+            svi_services: vec!["test-svc".to_string()],
             modules: vec![Some(module)],
         };
 
@@ -1438,13 +1423,13 @@ mod tests {
             omit_slot_prefix: true,
             slot_index_base: None,
             vars: IndexMap::new(),
-            svi_services: vec!["svi-vlan1".to_string()],
+            svi_services: vec!["svi-vlan1".to_string(), "access-vlan2".to_string()],
             modules: vec![Some(module)],
         };
 
         let svi_block = build_svi_block(&config, &service_source).unwrap();
 
-        // Both SVIs should be present: Vlan1 from svi_services, Vlan2 from port service
+        // Both SVIs should be present: Vlan1 from svi_services, Vlan2 from svi_services
         assert!(svi_block.contains("Vlan1"), "standalone SVI service should be included");
         assert!(svi_block.contains("Vlan2"), "port-matched SVI should be included");
 

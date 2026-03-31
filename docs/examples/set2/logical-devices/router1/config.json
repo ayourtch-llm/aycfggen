@@ -8,6 +8,7 @@
     "hostname": "router1",
     "site-id": "BRANCH-042"
   },
+  "svi-services": ["wan-link", "voice"],
   "modules": [
     null,
     {

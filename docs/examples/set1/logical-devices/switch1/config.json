@@ -7,6 +7,7 @@
     "hostname": "switch1",
     "location": "Building-A Floor-2"
   },
+  "svi-services": ["access-vlan10"],
   "modules": [
     {
       "SKU": "WS-C3560-24TS",

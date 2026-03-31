@@ -236,11 +236,23 @@ pub fn extract_device(
     // from decomp_services, to ensure existing service matching works correctly on
     // subsequent extraction passes. The per-service vars (e.g., vlan_id) are stored in
     // PortAssignment.vars instead, where they can be used for variable expansion.
-    // Collect standalone SVI service names for this device's config.json
-    let standalone_svi_names: Vec<String> = standalone_svi_assignments
-        .iter()
-        .map(|a| a.service_name.clone())
-        .collect();
+    // Collect ALL SVI service names for this device's config.json.
+    // This is the authoritative list of which services contribute SVIs —
+    // build_svi_block uses only this list, not port-assignment services.
+    let mut all_svi_names: Vec<String> = Vec::new();
+    let mut seen_svi_names = std::collections::HashSet::new();
+    // Matched SVIs (assigned to port services)
+    for a in &svi_result.assignments {
+        if seen_svi_names.insert(a.service_name.clone()) {
+            all_svi_names.push(a.service_name.clone());
+        }
+    }
+    // Standalone SVIs (unmatched, device-specific)
+    for a in &standalone_svi_assignments {
+        if seen_svi_names.insert(a.service_name.clone()) {
+            all_svi_names.push(a.service_name.clone());
+        }
+    }
 
     let device_config = build_device_config(
         &device,
@@ -248,7 +260,7 @@ pub fn extract_device(
         &template_name,
         &device_vars,
         &service_vars_map,
-        &standalone_svi_names,
+        &all_svi_names,
     );
 
     // Merge standalone SVI services and assignments into the output.

@@ -6,6 +6,7 @@ pub mod interface_name;
 pub mod compile;
 pub mod validate;
 pub mod output;
+pub mod ios_parser;
 
 /// Regex pattern for config element markers: `!!!###<element-name>`
 /// Element names must match `[a-zA-Z0-9_-]+`.

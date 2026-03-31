@@ -17,7 +17,7 @@ fn run() -> anyhow::Result<()> {
         match target {
             Target::OfflineFile(path) => {
                 let save_path = args.save_commands.as_deref();
-                match run_extract_offline(&path, &dirs, save_path, args.recreate_hardware_profiles, args.round_trip) {
+                match run_extract_offline(&path, &dirs, save_path, args.recreate_hardware_profiles, args.round_trip, &args.exclude_serial) {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("error extracting from {:?}: {:#}", path, e);
@@ -41,7 +41,7 @@ fn run() -> anyhow::Result<()> {
                     if path.is_file() {
                         eprintln!("Processing file: {}", path.display());
                         let save_path = args.save_commands.as_deref();
-                        match run_extract_offline(&path, &dirs, save_path, args.recreate_hardware_profiles, args.round_trip) {
+                        match run_extract_offline(&path, &dirs, save_path, args.recreate_hardware_profiles, args.round_trip, &args.exclude_serial) {
                             Ok(()) => {}
                             Err(e) => {
                                 eprintln!("error extracting from {:?}: {:#}", path, e);
@@ -53,7 +53,7 @@ fn run() -> anyhow::Result<()> {
             }
             Target::LiveDevice(addr) => {
                 let save_path = args.save_commands.as_deref();
-                match run_extract_live(addr, &dirs, save_path, args.recreate_hardware_profiles, args.round_trip) {
+                match run_extract_live(addr, &dirs, save_path, args.recreate_hardware_profiles, args.round_trip, &args.exclude_serial) {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("error extracting from {}: {:#}", addr, e);

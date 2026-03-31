@@ -50,6 +50,10 @@ pub struct ExtractArgs {
     /// After extraction, compile each device and verify round-trip against original config
     #[arg(long)]
     pub round_trip: bool,
+
+    /// Comma-separated list of serial numbers to skip during extraction
+    #[arg(long, value_delimiter = ',')]
+    pub exclude_serial: Vec<String>,
 }
 
 // ─── ResolvedExtractDirs ──────────────────────────────────────────────────────
@@ -119,6 +123,7 @@ pub fn run_extract_offline(
     save_commands_path: Option<&std::path::Path>,
     recreate_hw: bool,
     round_trip: bool,
+    exclude_serials: &[String],
 ) -> Result<()> {
     // Read the entire command dump
     let content = std::fs::read_to_string(file_path)
@@ -139,7 +144,7 @@ pub fn run_extract_offline(
 
     if per_device.is_empty() {
         // No commands detected at all — try single-device fallback with raw content
-        return run_extract_sections(&content, &HashMap::new(), dirs, recreate_hw, round_trip);
+        return run_extract_sections(&content, &HashMap::new(), dirs, recreate_hw, round_trip, exclude_serials);
     }
 
     let device_count = per_device.len();
@@ -168,7 +173,7 @@ pub fn run_extract_offline(
         if device_count > 1 {
             eprintln!("Processing device: {}", hostname);
         }
-        run_extract_sections(&content, sections, dirs, recreate_hw, round_trip)?;
+        run_extract_sections(&content, sections, dirs, recreate_hw, round_trip, exclude_serials)?;
     }
 
     Ok(())
@@ -181,6 +186,7 @@ fn run_extract_sections(
     dirs: &ResolvedExtractDirs,
     recreate_hw: bool,
     round_trip: bool,
+    exclude_serials: &[String],
 ) -> Result<()> {
     use crate::extract::extract_device;
     use crate::fs_sinks::{
@@ -225,7 +231,7 @@ fn run_extract_sections(
         }
     }
 
-    // Run the extraction pipeline
+    // Run the extraction pipeline (we need to extract first to get the serial number)
     let output = extract_device(
         show_version_output,
         show_inventory_output,
@@ -234,6 +240,12 @@ fn run_extract_sections(
         &existing_services,
         &existing_elements,
     )?;
+
+    // Check if this device should be excluded
+    if exclude_serials.iter().any(|s| s == &output.device.serial_number) {
+        eprintln!("Skipping excluded device: {} ({})", output.device.hostname, output.device.serial_number);
+        return Ok(());
+    }
 
     // Write hardware templates (skip if already exists and not recreating)
     let hw_sink = FsHardwareTemplateSink::new(dirs.hardware_templates.clone());
@@ -553,6 +565,7 @@ pub fn run_extract_live(
     save_commands_path: Option<&std::path::Path>,
     recreate_hw: bool,
     round_trip: bool,
+    exclude_serials: &[String],
 ) -> Result<()> {
     let username = std::env::var("AYCFGEXTRACT_SSH_USERNAME")
         .map_err(|_| anyhow::anyhow!("AYCFGEXTRACT_SSH_USERNAME environment variable not set"))?;
@@ -591,7 +604,7 @@ pub fn run_extract_live(
     eprintln!("Command output saved to: {}", save_path.display());
 
     // Now run the offline extraction on the saved file
-    run_extract_offline(save_path, dirs, None, recreate_hw, round_trip)
+    run_extract_offline(save_path, dirs, None, recreate_hw, round_trip, exclude_serials)
 }
 
 /// Connect to a device via SSH and collect all extraction commands.

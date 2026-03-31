@@ -73,13 +73,16 @@ pub fn decompose_ports(
         ports: Vec::new(),
     };
     let mut service_counter = 0usize;
-    // Map from port-config content → service name (for dedup across groups)
+    // Map from normalized port-config content → service name (for dedup across groups).
+    // Keys are always normalized (trimmed lines) for consistent matching regardless
+    // of indentation differences between existing and extracted services.
     let mut content_to_service: HashMap<String, String> = HashMap::new();
 
-    // Seed with existing services
+    // Seed with existing services (normalize their content for the key)
     for (svc_name, svc_content) in existing_services {
+        let key = normalize_port_config(svc_content);
         content_to_service
-            .entry(svc_content.clone())
+            .entry(key)
             .or_insert_with(|| svc_name.clone());
     }
 
@@ -179,18 +182,21 @@ fn process_group(
     }
 
     // The template is the config with the highest count (break ties by first seen).
-    let template_lines: Vec<String> = {
+    // Track both normalized (for comparison) and original (for output) lines.
+    let (template_lines, template_original_lines): (Vec<String>, Vec<String>) = {
         let mut best_count = 0usize;
-        let mut best: Option<Vec<String>> = None;
+        let mut best_norm: Option<Vec<String>> = None;
+        let mut best_orig: Option<Vec<String>> = None;
         // Iterate in member order for stable first-seen tie-breaking.
         for pd in &group.members {
             let count = *config_counts.get(&pd.normalized_lines).unwrap_or(&0);
             if count > best_count {
                 best_count = count;
-                best = Some(pd.normalized_lines.clone());
+                best_norm = Some(pd.normalized_lines.clone());
+                best_orig = Some(pd.original_lines.clone());
             }
         }
-        best.unwrap_or_default()
+        (best_norm.unwrap_or_default(), best_orig.unwrap_or_default())
     };
 
     // ── Step 4: detect deviations and handle shutdown ─────────────────────────
@@ -215,7 +221,8 @@ fn process_group(
     }
 
     // Get or create the base service for the template.
-    let template_port_config = normalized_to_port_config(&template_lines);
+    // Use original lines (with indentation) for the port-config content.
+    let template_port_config = lines_to_port_config(&template_original_lines);
     let base_service_name =
         get_or_create_service(&template_port_config, &template_lines, existing_services, content_to_service, result, service_counter);
 
@@ -228,9 +235,9 @@ fn process_group(
     for (_dev_set, dev_ports) in &deviation_groups {
         if dev_ports.len() >= 3 {
             // Promote deviation to new service
-            // Reconstruct the full config for these ports (use first member's normalized lines).
+            // Use first member's original lines (with indentation) for the service content.
             let full_lines = &dev_ports[0].normalized_lines;
-            let port_config = normalized_to_port_config(full_lines);
+            let port_config = lines_to_port_config(&dev_ports[0].original_lines);
             let svc_name = get_or_create_service(
                 &port_config,
                 full_lines,
@@ -257,8 +264,8 @@ fn process_group(
 
                 if prologue.is_none() && epilogue.is_none() && pd.normalized_lines != template_lines {
                     // Unclean split — can't decompose into prologue+service+epilogue.
-                    // Create a new service for this port's full config.
-                    let full_config = normalized_to_port_config(&pd.normalized_lines);
+                    // Create a new service for this port's full config (with original indentation).
+                    let full_config = lines_to_port_config(&pd.original_lines);
                     let svc_name = get_or_create_service(
                         &full_config,
                         &pd.normalized_lines,
@@ -283,18 +290,19 @@ fn get_or_create_shutdown_service(
     content_to_service: &mut HashMap<String, String>,
     result: &mut DecompositionResult,
 ) -> String {
-    let content = "shutdown\n".to_string();
-    if let Some(name) = content_to_service.get(&content) {
+    let content = " shutdown\n".to_string();
+    let key = normalize_port_config(&content);
+    if let Some(name) = content_to_service.get(&key) {
         return name.clone();
     }
     // Check existing services by name "shutdown"
     if let Some(existing_content) = existing_services.get("shutdown") {
-        if existing_content == &content {
-            content_to_service.insert(content, "shutdown".to_string());
+        if normalize_port_config(existing_content) == key {
+            content_to_service.insert(key, "shutdown".to_string());
             return "shutdown".to_string();
         }
     }
-    content_to_service.insert(content.clone(), "shutdown".to_string());
+    content_to_service.insert(key, "shutdown".to_string());
     result.services.push(DerivedService {
         name: "shutdown".to_string(),
         port_config: content,
@@ -304,7 +312,27 @@ fn get_or_create_shutdown_service(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Convert normalized lines to the port-config.txt string (one line per line, no leading space).
+/// Normalize port-config content for comparison: trim each line, join with newline.
+fn normalize_port_config(content: &str) -> String {
+    let mut s = String::new();
+    for line in content.lines() {
+        s.push_str(line.trim());
+        s.push('\n');
+    }
+    s
+}
+
+/// Convert lines to port-config.txt string content, preserving original formatting.
+fn lines_to_port_config(lines: &[String]) -> String {
+    let mut s = String::new();
+    for line in lines {
+        s.push_str(line);
+        s.push('\n');
+    }
+    s
+}
+
+/// Convert normalized (trimmed) lines to port-config.txt string.
 fn normalized_to_port_config(lines: &[String]) -> String {
     let mut s = String::new();
     for line in lines {
@@ -323,12 +351,14 @@ fn get_or_create_service(
     result: &mut DecompositionResult,
     service_counter: &mut usize,
 ) -> String {
-    if let Some(name) = content_to_service.get(port_config) {
+    // Use normalized key for matching (indentation-insensitive)
+    let key = normalize_port_config(port_config);
+    if let Some(name) = content_to_service.get(&key) {
         return name.clone();
     }
     // Generate a name from structural properties.
     let name = derive_service_name(normalized_lines, service_counter);
-    content_to_service.insert(port_config.to_string(), name.clone());
+    content_to_service.insert(key, name.clone());
     result.services.push(DerivedService {
         name: name.clone(),
         port_config: port_config.to_string(),
@@ -476,15 +506,16 @@ fn compute_prologue_epilogue(
         }
     }
 
-    // Clean split: lines before first_match are prologue, lines after last_match are epilogue
+    // Clean split: lines before first_match are prologue, lines after last_match are epilogue.
+    // Preserve original formatting (including indentation) for round-trip fidelity.
     let mut prologue_lines: Vec<&str> = Vec::new();
     for pos in 0..first_match {
-        prologue_lines.push(original_lines[pos].trim());
+        prologue_lines.push(&original_lines[pos]);
     }
 
     let mut epilogue_lines: Vec<&str> = Vec::new();
     for pos in (last_match + 1)..original_lines.len() {
-        epilogue_lines.push(original_lines[pos].trim());
+        epilogue_lines.push(&original_lines[pos]);
     }
 
     let prologue = if prologue_lines.is_empty() {

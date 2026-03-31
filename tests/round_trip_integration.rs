@@ -430,7 +430,6 @@ fn test_existing_services_no_new_services_created() {
 // Track with: TODO fix extractor indentation stripping
 
 #[test]
-#[ignore = "known bug: extractor strips interface body indentation; round-trip fails until fixed"]
 fn test_simple_4port_switch_round_trip_indentation_bug() {
     let tmp = make_temp_dir("4port_rt_indent");
 

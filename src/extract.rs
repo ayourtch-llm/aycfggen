@@ -196,6 +196,7 @@ pub fn extract_device(
             svi_config: svi_result.assignments.iter()
                 .find(|a| a.service_name == s.name)
                 .map(|a| a.svi_config.clone()),
+            vars: HashMap::new(),
         }).collect(),
         device_vars: IndexMap::new().into_iter().collect(),
     });

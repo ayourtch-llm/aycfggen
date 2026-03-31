@@ -16,6 +16,9 @@ const KNOWN_PREFIXES: &[&str] = &[
     "TwentyFiveGigE",
     "FortyGigabitEthernet",
     "TenGigabitEthernet",
+    "FiveGigabitEthernet",
+    "TwoGigabitEthernet",
+    "AppGigabitEthernet",
     "HundredGigE",
     "GigabitEthernet",
     "FastEthernet",
@@ -161,14 +164,36 @@ pub fn discover_hardware(
     interfaces: &[InterfaceBriefEntry],
 ) -> Result<DiscoveredDevice> {
     // ── Step 1: collect slotted inventory items ───────────────────────────────
-    // Sort slotted items by their (0-based) inventory slot number so they can be
-    // aligned positionally with the slot numbers seen in interface names.
     let mut slotted: Vec<&InventoryItem> = inventory.iter().filter(|i| i.slot.is_some()).collect();
     slotted.sort_by_key(|i| i.slot.unwrap());
     let module_count = slotted.len();
-    let is_multi_module = module_count > 1;
 
-    // ── Step 2: parse physical interface names ────────────────────────────────
+    // ── Step 2: detect multi-module from BOTH inventory AND interface naming ──
+    // A device is multi-module if inventory has >1 slotted item, OR if physical
+    // interface names have 3+ slash-separated segments (e.g., GigabitEthernet1/0/1),
+    // indicating a slot prefix even for single-module stacks.
+    let ifaces_look_multi = interfaces.iter().any(|e| {
+        // Skip virtual prefixes
+        for vp in VIRTUAL_PREFIXES {
+            if e.name.starts_with(vp) {
+                return false;
+            }
+        }
+        // Check if the numeric portion after the prefix has 3+ slash-separated segments
+        for prefix in KNOWN_PREFIXES {
+            if e.name.starts_with(prefix) {
+                let after = &e.name[prefix.len()..];
+                // Strip sub-interface suffix for counting
+                let numeric = after.split('.').next().unwrap_or(after);
+                let slash_count = numeric.chars().filter(|&c| c == '/').count();
+                return slash_count >= 2; // e.g., "1/0/1" has 2 slashes = 3 segments
+            }
+        }
+        false
+    });
+    let is_multi_module = module_count > 1 || ifaces_look_multi;
+
+    // ── Step 3: parse physical interface names ────────────────────────────────
     // Filter out virtual interfaces and sub-interfaces; keep only physical ports.
     let physical_ifaces: Vec<ParsedInterfaceName> = interfaces
         .iter()
@@ -188,18 +213,18 @@ pub fn discover_hardware(
         })
         .collect();
 
-    // ── Step 3: determine omit_slot_prefix and slot_index_base ───────────────
+    // ── Step 4: determine omit_slot_prefix and slot_index_base ───────────────
     // omit_slot_prefix: true only when single module AND interface names have no slot segment
     let has_slot_in_ifaces = physical_ifaces.iter().any(|i| i.slot.is_some());
     let omit_slot_prefix = !is_multi_module && !has_slot_in_ifaces;
 
-    // slot_index_base: lowest slot number as seen in interface names (for multi-module),
+    // slot_index_base: lowest slot number as seen in interface names,
     // or 0 for single-module devices (interface names have no slot component).
-    let slot_index_base: u32 = if is_multi_module {
-        physical_ifaces.iter().filter_map(|i| i.slot).min().unwrap_or(0)
-    } else {
-        0
-    };
+    let slot_index_base: u32 = physical_ifaces
+        .iter()
+        .filter_map(|i| i.slot)
+        .min()
+        .unwrap_or(0);
 
     // ── Step 4: group physical interfaces by slot ─────────────────────────────
     // For multi-module devices: group by the slot number parsed from the interface name.
@@ -241,9 +266,8 @@ pub fn discover_hardware(
     }
 
     // ── Step 6: build modules ─────────────────────────────────────────────────
-    // Inventory items are sorted by their 0-based slot, so we align them positionally
-    // to the interface-space slots (sorted ascending).  inventory_item[i] corresponds
-    // to the i-th distinct slot number seen in the interfaces.
+    // Match inventory items to interface slots by slot number:
+    // inventory item with 0-based slot N corresponds to interface slot (N + slot_index_base).
     let fallback_inv: Option<&InventoryItem> = if slotted.is_empty() {
         inventory.first()
     } else {
@@ -252,10 +276,13 @@ pub fn discover_hardware(
 
     let mut modules: Vec<DiscoveredModule> = Vec::new();
 
-    for (slot_idx, &slot) in all_slots.iter().enumerate() {
-        // Match inventory item by positional alignment
-        let inv_item: Option<&InventoryItem> =
-            slotted.get(slot_idx).copied().or(fallback_inv);
+    for &slot in &all_slots {
+        // Find inventory item whose 0-based slot maps to this interface slot
+        let inv_item: Option<&InventoryItem> = slotted
+            .iter()
+            .find(|i| i.slot.unwrap() + slot_index_base == slot)
+            .copied()
+            .or(fallback_inv);
 
         let (sku, serial) = if let Some(item) = inv_item {
             (item.pid.clone(), item.serial.clone())
@@ -676,5 +703,81 @@ Loopback0              10.0.0.1        YES NVRAM  up                    up
         assert_eq!(device.modules[0].hardware_template.ports.len(), 0);
         // omit_slot_prefix: single module, no slot in interface names → true
         assert!(device.omit_slot_prefix);
+    }
+
+    // ── discover_hardware: single-module with slot-prefix interfaces ─────────
+    // A single C3850 in a stack still uses GigabitEthernet1/0/1 naming
+
+    const SHOW_INVENTORY_SINGLE_STACK: &str = "\
+NAME: \"Switch 1\", DESCR: \"WS-C3850-24T\"
+PID: WS-C3850-24T  , VID: V01  , SN: FOC2001A1BB
+
+";
+
+    const SHOW_IP_BRIEF_SINGLE_STACK: &str = "\
+Interface              IP-Address      OK? Method Status                Protocol
+GigabitEthernet1/0/1   unassigned      YES unset  up                    up
+GigabitEthernet1/0/2   unassigned      YES unset  up                    up
+GigabitEthernet1/0/3   unassigned      YES unset  down                  down
+Vlan1                  192.168.1.1     YES NVRAM  up                    up
+";
+
+    #[test]
+    fn test_single_module_with_slot_prefix_interfaces() {
+        let version = parse_show_version(SHOW_VERSION_STACK).unwrap();
+        let inventory = parse_show_inventory(SHOW_INVENTORY_SINGLE_STACK);
+        let interfaces = parse_show_ip_interface_brief(SHOW_IP_BRIEF_SINGLE_STACK);
+
+        let device = discover_hardware(&version, &inventory, &interfaces).unwrap();
+
+        // Even though inventory has 1 slot, interface names show slot prefix
+        assert!(!device.omit_slot_prefix, "slot-prefix interfaces → omit_slot_prefix=false");
+        assert_eq!(device.slot_index_base, 1);
+        assert_eq!(device.modules.len(), 1);
+        assert_eq!(device.modules[0].sku, "WS-C3850-24T");
+        assert_eq!(device.modules[0].hardware_template.ports.len(), 3);
+        // Port indices should NOT include the slot
+        assert_eq!(device.modules[0].hardware_template.ports["Port0"].index, "0/1");
+    }
+
+    // ── discover_hardware: inventory gap (switch 2 missing from interfaces) ──
+
+    const SHOW_INVENTORY_3_SWITCHES: &str = "\
+NAME: \"Switch 1\", DESCR: \"WS-C3850-24T\"
+PID: WS-C3850-24T  , VID: V01  , SN: FOC_SW1
+
+NAME: \"Switch 2\", DESCR: \"WS-C3850-24T\"
+PID: WS-C3850-24T  , VID: V01  , SN: FOC_SW2
+
+NAME: \"Switch 3\", DESCR: \"WS-C3850-24T\"
+PID: WS-C3850-24T  , VID: V01  , SN: FOC_SW3
+
+";
+
+    const SHOW_IP_BRIEF_GAP: &str = "\
+Interface              IP-Address      OK? Method Status                Protocol
+GigabitEthernet1/0/1   unassigned      YES unset  up                    up
+GigabitEthernet1/0/2   unassigned      YES unset  up                    up
+GigabitEthernet3/0/1   unassigned      YES unset  up                    up
+GigabitEthernet3/0/2   unassigned      YES unset  up                    up
+";
+
+    #[test]
+    fn test_inventory_gap_slot_number_matching() {
+        let version = parse_show_version(SHOW_VERSION_STACK).unwrap();
+        let inventory = parse_show_inventory(SHOW_INVENTORY_3_SWITCHES);
+        let interfaces = parse_show_ip_interface_brief(SHOW_IP_BRIEF_GAP);
+
+        let device = discover_hardware(&version, &inventory, &interfaces).unwrap();
+
+        assert_eq!(device.slot_index_base, 1);
+        // Should have 2 modules (slots 1 and 3 from interfaces)
+        assert_eq!(device.modules.len(), 2);
+        // Slot 1 matches inventory Switch 1 (inv slot 0, +1 = iface slot 1)
+        assert_eq!(device.modules[0].serial, "FOC_SW1");
+        assert_eq!(device.modules[0].slot, 1);
+        // Slot 3 matches inventory Switch 3 (inv slot 2, +1 = iface slot 3)
+        assert_eq!(device.modules[1].serial, "FOC_SW3");
+        assert_eq!(device.modules[1].slot, 3);
     }
 }

@@ -1,0 +1,509 @@
+/// Extraction orchestrator: ties all pipeline stages together.
+///
+/// Runs the full extraction pipeline on parsed command output and returns
+/// all artifacts needed to write to disk.
+
+use std::collections::HashMap;
+use anyhow::{anyhow, Result};
+use indexmap::IndexMap;
+
+use crate::hardware_discovery::{discover_hardware, DiscoveredDevice};
+use crate::ios_parser::{parse_running_config, ConfigBlock};
+use crate::model::{LogicalDeviceConfig, Module, PortAssignment};
+use crate::port_decomposition::{decompose_ports, DerivedService};
+use crate::show_parsers::{parse_show_inventory, parse_show_ip_interface_brief, parse_show_version};
+use crate::svi_extraction::{extract_svis, SviAssignment};
+use crate::template_builder::{build_template, GlobalSection, NewConfigElement};
+use crate::variable_extraction::NoOpExtractor;
+
+// ─── ExtractionOutput ─────────────────────────────────────────────────────────
+
+/// All artifacts produced by the extraction pipeline for a single device.
+pub struct ExtractionOutput {
+    /// Stage 1 result: discovered device metadata and modules.
+    pub device: DiscoveredDevice,
+    /// Stage 1 result: per-SKU hardware templates (unique SKUs only).
+    pub hardware_templates: HashMap<String, crate::model::HardwareTemplate>,
+    /// Stage 2 result: derived services (new or matched).
+    pub services: Vec<DerivedService>,
+    /// Stage 3 result: SVI assignments to services.
+    pub svi_assignments: Vec<SviAssignment>,
+    /// Stage 4 result: template file name (`<hostname>-<serial>.conf`).
+    pub template_name: String,
+    /// Stage 4 result: template file content.
+    pub template_content: String,
+    /// Stage 4 result: new config elements that should be created.
+    pub new_elements: Vec<NewConfigElement>,
+    /// The assembled LogicalDeviceConfig ready to write.
+    pub device_config: LogicalDeviceConfig,
+}
+
+// ─── extract_device ───────────────────────────────────────────────────────────
+
+/// Run the full extraction pipeline on parsed command output.
+///
+/// # Parameters
+///
+/// - `show_version_output` — output of `show version`
+/// - `show_inventory_output` — output of `show inventory`
+/// - `show_ip_brief_output` — output of `show ip interface brief`
+/// - `show_running_config` — output of `show running-config`
+/// - `existing_services` — service_name → port-config.txt content (from data store)
+/// - `existing_elements` — element_name → apply.txt content (from data store)
+pub fn extract_device(
+    show_version_output: &str,
+    show_inventory_output: &str,
+    show_ip_brief_output: &str,
+    show_running_config: &str,
+    existing_services: &HashMap<String, String>,
+    existing_elements: &HashMap<String, String>,
+) -> Result<ExtractionOutput> {
+    // ── Stage 0: Parse show commands ──────────────────────────────────────────
+    let version = parse_show_version(show_version_output)
+        .ok_or_else(|| anyhow!("failed to parse show version output"))?;
+    let inventory = parse_show_inventory(show_inventory_output);
+    let interfaces = parse_show_ip_interface_brief(show_ip_brief_output);
+
+    // ── Stage 1: Hardware discovery ───────────────────────────────────────────
+    let device = discover_hardware(&version, &inventory, &interfaces)?;
+
+    // Collect unique hardware templates by SKU
+    let mut hardware_templates: HashMap<String, crate::model::HardwareTemplate> = HashMap::new();
+    for module in &device.modules {
+        hardware_templates
+            .entry(module.sku.clone())
+            .or_insert_with(|| module.hardware_template.clone());
+    }
+
+    // Build interface_name → port_id map from Stage 1 results.
+    // For each module, derive the full interface name for each port using the hardware template.
+    let port_id_map = build_port_id_map(&device);
+
+    // ── Stage 0b: Parse running config ────────────────────────────────────────
+    let config_blocks = parse_running_config(show_running_config);
+
+    // Separate blocks into categories
+    let mut port_blocks: Vec<(String, Vec<String>)> = Vec::new();
+    let mut svi_blocks: Vec<(String, u16, Vec<String>)> = Vec::new();
+    let mut global_sections: Vec<GlobalSection> = Vec::new();
+
+    let mut first_port_seen = false;
+    let mut first_svi_seen = false;
+
+    // We accumulate global config lines until a non-global block is encountered.
+    let mut pending_global: Vec<String> = Vec::new();
+
+    let flush_pending = |pending: &mut Vec<String>, sections: &mut Vec<GlobalSection>| {
+        if !pending.is_empty() {
+            sections.push(GlobalSection::Config(pending.drain(..).collect()));
+        }
+    };
+
+    for block in config_blocks {
+        match block {
+            ConfigBlock::PhysicalPort { name, lines } | ConfigBlock::SubInterface { name, lines } => {
+                if !first_port_seen {
+                    flush_pending(&mut pending_global, &mut global_sections);
+                    global_sections.push(GlobalSection::PortsMarker);
+                    first_port_seen = true;
+                }
+                port_blocks.push((name, lines));
+            }
+            ConfigBlock::Svi { name, vlan, lines } => {
+                if !first_svi_seen {
+                    flush_pending(&mut pending_global, &mut global_sections);
+                    global_sections.push(GlobalSection::SviMarker);
+                    first_svi_seen = true;
+                }
+                svi_blocks.push((name, vlan, lines));
+            }
+            ConfigBlock::VirtualInterface { name, lines } => {
+                flush_pending(&mut pending_global, &mut global_sections);
+                global_sections.push(GlobalSection::VirtualInterface(name, lines));
+            }
+            ConfigBlock::GlobalConfig { lines } => {
+                pending_global.extend(lines);
+            }
+            ConfigBlock::MultiLineConstruct { keyword, content } => {
+                flush_pending(&mut pending_global, &mut global_sections);
+                global_sections.push(GlobalSection::MultiLine(keyword, content));
+            }
+        }
+    }
+    // Flush any remaining pending global config
+    flush_pending(&mut pending_global, &mut global_sections);
+
+    // ── Stage 2: Port decomposition ───────────────────────────────────────────
+    let decomp = decompose_ports(&port_blocks, existing_services, &port_id_map);
+
+    // ── Stage 3: SVI extraction ───────────────────────────────────────────────
+    // Build service_vlans: which VLANs does each service reference?
+    let service_vlans = build_service_vlans(&decomp.services);
+
+    // Service creation order follows decomp.services order
+    let service_creation_order: Vec<String> = decomp.services.iter().map(|s| s.name.clone()).collect();
+
+    let svi_result = extract_svis(&svi_blocks, &service_vlans, &service_creation_order);
+
+    // Add unmatched SVIs back as literal text into global sections.
+    // They go after the SVI marker in the global sections.
+    // We add them as Config sections containing the literal text lines.
+    for unmatched in &svi_result.unmatched {
+        let lines: Vec<String> = unmatched.literal_text.lines().map(|l| l.to_string()).collect();
+        if !lines.is_empty() {
+            // Find insertion point — after SVI marker if present
+            // For simplicity, append to global sections (will be placed after markers)
+            global_sections.push(GlobalSection::Config(lines));
+        }
+    }
+
+    // ── Stage 4: Template builder ──────────────────────────────────────────────
+    let template_result = build_template(&global_sections, existing_elements, None, None);
+
+    let template_name = format!("{}-{}.conf", device.hostname, device.serial_number);
+
+    // ── Stage 5: Variable extraction (no-op) ──────────────────────────────────
+    use crate::variable_extraction::{ExtractionArtifacts, ServiceArtifact, VariableExtractor};
+    let extractor = NoOpExtractor;
+    let _artifacts = extractor.extract(ExtractionArtifacts {
+        template_content: template_result.template_content.clone(),
+        services: decomp.services.iter().map(|s| ServiceArtifact {
+            name: s.name.clone(),
+            port_config: s.port_config.clone(),
+            svi_config: svi_result.assignments.iter()
+                .find(|a| a.service_name == s.name)
+                .map(|a| a.svi_config.clone()),
+        }).collect(),
+        device_vars: IndexMap::new().into_iter().collect(),
+    });
+
+    // ── Build LogicalDeviceConfig ──────────────────────────────────────────────
+    let device_config = build_device_config(&device, &decomp.ports, &template_name);
+
+    Ok(ExtractionOutput {
+        device,
+        hardware_templates,
+        services: decomp.services,
+        svi_assignments: svi_result.assignments,
+        template_name,
+        template_content: template_result.template_content,
+        new_elements: template_result.new_elements,
+        device_config,
+    })
+}
+
+// ─── Helper: build interface_name → port_id map ────────────────────────────────
+
+/// Build a map from full IOS interface name → port identifier (`Port0`, `Port1`, etc.)
+/// using the discovered hardware profiles and slot configuration.
+fn build_port_id_map(device: &DiscoveredDevice) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+
+    for module in &device.modules {
+        for (port_id, port_def) in &module.hardware_template.ports {
+            // Reconstruct the full interface name
+            let iface_name = if device.omit_slot_prefix {
+                // Single-module, no slot prefix: e.g., GigabitEthernet0/0
+                format!("{}{}", port_def.name, port_def.index)
+            } else {
+                // Multi-module: e.g., GigabitEthernet1/0/0
+                format!("{}{}/{}", port_def.name, module.slot, port_def.index)
+            };
+            map.insert(iface_name, port_id.clone());
+        }
+    }
+
+    map
+}
+
+// ─── Helper: build service → VLANs map ────────────────────────────────────────
+
+/// Extract which VLANs each service references from its port-config.txt content.
+fn build_service_vlans(services: &[DerivedService]) -> HashMap<String, Vec<u16>> {
+    let mut result: HashMap<String, Vec<u16>> = HashMap::new();
+
+    for svc in services {
+        let mut vlans: Vec<u16> = Vec::new();
+        for line in svc.port_config.lines() {
+            let trimmed = line.trim();
+            // Access port VLAN
+            if let Some(rest) = trimmed.strip_prefix("switchport access vlan ") {
+                if let Ok(v) = rest.trim().parse::<u16>() {
+                    if !vlans.contains(&v) {
+                        vlans.push(v);
+                    }
+                }
+            }
+            // Trunk allowed VLANs
+            if let Some(rest) = trimmed.strip_prefix("switchport trunk allowed vlan ") {
+                for part in rest.trim().split(',') {
+                    let part = part.trim();
+                    // Handle ranges like "10-20"
+                    if let Some((start, end)) = part.split_once('-') {
+                        if let (Ok(s), Ok(e)) = (start.parse::<u16>(), end.parse::<u16>()) {
+                            for v in s..=e {
+                                if !vlans.contains(&v) {
+                                    vlans.push(v);
+                                }
+                            }
+                        }
+                    } else if let Ok(v) = part.parse::<u16>() {
+                        if !vlans.contains(&v) {
+                            vlans.push(v);
+                        }
+                    }
+                }
+            }
+        }
+        if !vlans.is_empty() {
+            result.insert(svc.name.clone(), vlans);
+        }
+    }
+
+    result
+}
+
+// ─── Helper: assemble LogicalDeviceConfig ─────────────────────────────────────
+
+fn build_device_config(
+    device: &DiscoveredDevice,
+    ports: &[crate::port_decomposition::DecomposedPort],
+    template_name: &str,
+) -> LogicalDeviceConfig {
+    // Build a map from port_id to DecomposedPort for lookup
+    let port_map: HashMap<&str, &crate::port_decomposition::DecomposedPort> =
+        ports.iter().map(|p| (p.port_id.as_str(), p)).collect();
+
+    // Determine the slot range to decide how many module slots to emit.
+    // For single-module devices: just one slot.
+    // For multi-module: slot indices from slot_index_base to max_slot (with None for gaps).
+    let max_slot = device.modules.iter().map(|m| m.slot).max().unwrap_or(0);
+    let min_slot = device.slot_index_base;
+
+    // Build the modules array; gaps between slot_index_base and max_slot become None.
+    let modules: Vec<Option<Module>> = (min_slot..=max_slot)
+        .map(|slot| {
+            let discovered = device.modules.iter().find(|m| m.slot == slot)?;
+            // Collect port assignments for this module
+            let port_assignments: Vec<PortAssignment> = discovered
+                .hardware_template
+                .ports
+                .iter()
+                .filter_map(|(port_id, _)| {
+                    let dp = port_map.get(port_id.as_str())?;
+                    Some(PortAssignment {
+                        name: port_id.clone(),
+                        service: dp.service_name.clone(),
+                        prologue: dp.prologue.clone(),
+                        epilogue: dp.epilogue.clone(),
+                        vars: IndexMap::new(),
+                    })
+                })
+                .collect();
+
+            Some(Module {
+                sku: discovered.sku.clone(),
+                serial: if discovered.serial.is_empty() { None } else { Some(discovered.serial.clone()) },
+                ports: port_assignments,
+            })
+        })
+        .collect();
+
+    let software_image = if device.software_image.is_empty() {
+        None
+    } else {
+        Some(device.software_image.clone())
+    };
+
+    LogicalDeviceConfig {
+        config_template: template_name.to_string(),
+        software_image,
+        role: Some("discovered".to_string()),
+        vendor: None,
+        omit_slot_prefix: device.omit_slot_prefix,
+        slot_index_base: if device.slot_index_base == 0 && device.omit_slot_prefix {
+            None
+        } else {
+            Some(device.slot_index_base)
+        },
+        vars: IndexMap::new(),
+        modules,
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A minimal 2-port switch fixture
+    const SHOW_VERSION: &str = r#"
+switch1 uptime is 1 day, 2 hours, 3 minutes
+System image file is "flash:c3560-ipbasek9-mz.150-2.SE11.bin"
+Model number                    : WS-C3560-2TS
+System serial number            : FOC9999TEST
+"#;
+
+    const SHOW_INVENTORY: &str = r#"
+NAME: "1", DESCR: "WS-C3560-2TS chassis"
+PID: WS-C3560-2TS     , VID: V02 , SN: FOC9999TEST
+"#;
+
+    const SHOW_IP_BRIEF: &str = r#"
+Interface              IP-Address      OK? Method Status                Protocol
+GigabitEthernet0/0     unassigned      YES unset  up                    up
+GigabitEthernet0/1     unassigned      YES unset  down                  down
+"#;
+
+    const SHOW_RUNNING_CONFIG: &str = r#"
+hostname switch1
+!
+logging buffered 16384
+!
+interface GigabitEthernet0/0
+ switchport mode access
+ switchport access vlan 10
+!
+interface GigabitEthernet0/1
+ switchport mode access
+ switchport access vlan 10
+!
+interface Vlan10
+ ip address 10.0.0.1 255.255.255.0
+!
+end
+"#;
+
+    #[test]
+    fn test_extract_device_simple_2port_switch() {
+        let existing_services: HashMap<String, String> = HashMap::new();
+        let existing_elements: HashMap<String, String> = HashMap::new();
+
+        let output = extract_device(
+            SHOW_VERSION,
+            SHOW_INVENTORY,
+            SHOW_IP_BRIEF,
+            SHOW_RUNNING_CONFIG,
+            &existing_services,
+            &existing_elements,
+        ).expect("extraction should succeed");
+
+        // Verify device metadata
+        assert_eq!(output.device.hostname, "switch1");
+        assert_eq!(output.device.serial_number, "FOC9999TEST");
+        assert_eq!(output.device.software_image, "c3560-ipbasek9-mz.150-2.SE11.bin");
+        assert!(output.device.omit_slot_prefix, "single-module device should omit slot prefix");
+
+        // Verify hardware template
+        assert!(output.hardware_templates.contains_key("WS-C3560-2TS"),
+            "hardware template for WS-C3560-2TS should be present");
+        let tmpl = &output.hardware_templates["WS-C3560-2TS"];
+        assert_eq!(tmpl.ports.len(), 2, "should have 2 ports");
+
+        // Verify services
+        assert_eq!(output.services.len(), 1, "both ports map to same service");
+        assert_eq!(output.services[0].name, "access-vlan10");
+
+        // Verify SVI assignments
+        assert_eq!(output.svi_assignments.len(), 1);
+        assert_eq!(output.svi_assignments[0].service_name, "access-vlan10");
+        assert_eq!(output.svi_assignments[0].vlan, 10);
+
+        // Verify template name format
+        assert_eq!(output.template_name, "switch1-FOC9999TEST.conf");
+
+        // Verify template content contains key elements
+        assert!(output.template_content.contains("hostname switch1"),
+            "template should contain hostname line");
+        assert!(output.template_content.contains("<PORTS-CONFIGURATION>"),
+            "template should contain PORTS marker");
+        assert!(output.template_content.contains("<SVI-CONFIGURATION>"),
+            "template should contain SVI marker");
+
+        // Verify device config
+        assert_eq!(output.device_config.config_template, "switch1-FOC9999TEST.conf");
+        assert_eq!(output.device_config.role.as_deref(), Some("discovered"));
+        assert_eq!(output.device_config.software_image.as_deref(),
+            Some("c3560-ipbasek9-mz.150-2.SE11.bin"));
+        assert!(output.device_config.omit_slot_prefix);
+        assert_eq!(output.device_config.modules.len(), 1);
+
+        let module = output.device_config.modules[0].as_ref().expect("module should be present");
+        assert_eq!(module.sku, "WS-C3560-2TS");
+        assert_eq!(module.ports.len(), 2, "module should have 2 port assignments");
+        for port in &module.ports {
+            assert_eq!(port.service, "access-vlan10");
+        }
+    }
+
+    #[test]
+    fn test_template_name_format() {
+        let existing_services: HashMap<String, String> = HashMap::new();
+        let existing_elements: HashMap<String, String> = HashMap::new();
+
+        let output = extract_device(
+            SHOW_VERSION,
+            SHOW_INVENTORY,
+            SHOW_IP_BRIEF,
+            SHOW_RUNNING_CONFIG,
+            &existing_services,
+            &existing_elements,
+        ).expect("extraction should succeed");
+
+        // Template name must be <hostname>-<serial>.conf
+        assert_eq!(output.template_name, "switch1-FOC9999TEST.conf");
+        assert!(output.template_name.ends_with(".conf"));
+        assert!(output.template_name.contains('-'));
+        let parts: Vec<&str> = output.template_name.splitn(2, '-').collect();
+        assert_eq!(parts[0], "switch1", "first part should be hostname");
+        assert!(parts[1].starts_with("FOC9999TEST"), "second part should start with serial");
+    }
+
+    #[test]
+    fn test_extract_device_uses_existing_services() {
+        let mut existing_services: HashMap<String, String> = HashMap::new();
+        existing_services.insert(
+            "my-custom-service".to_string(),
+            "switchport mode access\nswitchport access vlan 10\n".to_string(),
+        );
+        let existing_elements: HashMap<String, String> = HashMap::new();
+
+        let output = extract_device(
+            SHOW_VERSION,
+            SHOW_INVENTORY,
+            SHOW_IP_BRIEF,
+            SHOW_RUNNING_CONFIG,
+            &existing_services,
+            &existing_elements,
+        ).expect("extraction should succeed");
+
+        // The existing service matches our ports, so no new services should be created
+        assert!(output.services.is_empty(),
+            "no new services should be created when existing service matches");
+
+        // Port assignments should reference the existing service
+        let module = output.device_config.modules[0].as_ref().expect("module");
+        for port in &module.ports {
+            assert_eq!(port.service, "my-custom-service",
+                "port should use existing matching service");
+        }
+    }
+
+    #[test]
+    fn test_extract_device_invalid_show_version_fails() {
+        let existing_services: HashMap<String, String> = HashMap::new();
+        let existing_elements: HashMap<String, String> = HashMap::new();
+
+        let result = extract_device(
+            "this is not valid show version output",
+            SHOW_INVENTORY,
+            SHOW_IP_BRIEF,
+            SHOW_RUNNING_CONFIG,
+            &existing_services,
+            &existing_elements,
+        );
+
+        assert!(result.is_err(), "should fail with unparseable show version");
+    }
+}

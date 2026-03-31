@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use anyhow::Result;
 
@@ -132,11 +133,12 @@ pub fn run_extract_offline(
             .map_err(|e| anyhow::anyhow!("failed to save command dump to {:?}: {}", save_path, e))?;
     }
 
-    // Pass the entire file content to each parser (they skip unrecognized lines)
-    let show_version_output = content.as_str();
-    let show_inventory_output = content.as_str();
-    let show_ip_brief_output = content.as_str();
-    let show_running_config = content.as_str();
+    // Split the dump into sections by our markers, or fall back to passing everything.
+    let sections = split_command_dump(&content);
+    let show_version_output: &str = sections.get("show version").map(String::as_str).unwrap_or(&content);
+    let show_inventory_output: &str = sections.get("show inventory").map(String::as_str).unwrap_or(&content);
+    let show_ip_brief_output: &str = sections.get("show ip interface brief").map(String::as_str).unwrap_or(&content);
+    let show_running_config: &str = sections.get("show running-config").map(String::as_str).unwrap_or(&content);
 
     // Load existing services from the data store
     let service_source = FsServiceSource::new(dirs.services.clone());
@@ -218,6 +220,87 @@ pub fn run_extract_offline(
     println!("  Logical device written to: {}/config.json", output.device.serial_number);
 
     Ok(())
+}
+
+// ─── Command dump splitting ──────────────────────────────────────────────────
+
+/// Known show commands we look for when splitting a command dump.
+const KNOWN_COMMANDS: &[&str] = &[
+    "show version",
+    "show inventory",
+    "show ip interface brief",
+    "show interfaces status",
+    "show running-config",
+];
+
+/// Split a command dump file into sections.
+///
+/// Recognizes section boundaries in multiple formats:
+/// - `!!! aycfgextract: <command> !!!` (our own marker format)
+/// - `hostname#<command>` (IOS enable-mode prompt)
+/// - `hostname><command>` (IOS user-mode prompt)
+/// - Just `<command>` on a line by itself
+///
+/// Returns a map of command name → section content.
+/// If no markers are found, returns an empty map (caller falls back to full content).
+fn split_command_dump(content: &str) -> HashMap<String, String> {
+    let mut sections: HashMap<String, String> = HashMap::new();
+    let mut current_cmd: Option<String> = None;
+    let mut current_lines: Vec<&str> = Vec::new();
+
+    for line in content.lines() {
+        // Try to detect a command line
+        if let Some(cmd) = detect_command_line(line) {
+            // Flush previous section
+            if let Some(prev_cmd) = current_cmd.take() {
+                sections.insert(prev_cmd, current_lines.join("\n"));
+                current_lines.clear();
+            }
+            current_cmd = Some(cmd);
+        } else if current_cmd.is_some() {
+            current_lines.push(line);
+        }
+    }
+
+    // Flush last section
+    if let Some(cmd) = current_cmd {
+        sections.insert(cmd, current_lines.join("\n"));
+    }
+
+    sections
+}
+
+/// Detect if a line is a command marker/prompt, returning the normalized command name.
+fn detect_command_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    // Format 1: !!! aycfgextract: <command> !!!
+    if let Some(rest) = trimmed.strip_prefix("!!! aycfgextract: ") {
+        let cmd = rest.strip_suffix(" !!!").unwrap_or(rest);
+        return Some(cmd.to_string());
+    }
+
+    // Format 2: hostname#command or hostname>command (IOS prompt)
+    // Look for a known command after # or >
+    for sep in ['#', '>'] {
+        if let Some(pos) = trimmed.find(sep) {
+            let after_prompt = trimmed[pos + 1..].trim();
+            for &known in KNOWN_COMMANDS {
+                if after_prompt.eq_ignore_ascii_case(known) {
+                    return Some(known.to_string());
+                }
+            }
+        }
+    }
+
+    // Format 3: bare command on a line by itself
+    for &known in KNOWN_COMMANDS {
+        if trimmed.eq_ignore_ascii_case(known) {
+            return Some(known.to_string());
+        }
+    }
+
+    None
 }
 
 // ─── run_extract_live ────────────────────────────────────────────────────────

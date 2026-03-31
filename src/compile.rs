@@ -135,9 +135,18 @@ pub fn build_svi_block(
     config: &LogicalDeviceConfig,
     service_source: &dyn ServiceSource,
 ) -> Result<String> {
-    // Collect services relevant to THIS device: port-assignment services + svi_services.
+    // Collect services relevant to THIS device: svi_services + port-assignment services.
+    // Standalone SVI services come first so they take precedence over shared services
+    // when deduplicating by VLAN number (device-specific SVIs override shared ones).
     let mut relevant_services: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+
+    // Standalone SVI services listed in config.json (take precedence)
+    for svc in &config.svi_services {
+        if seen.insert(svc.clone()) {
+            relevant_services.push(svc.clone());
+        }
+    }
 
     // Services from port assignments (in first-occurrence order)
     for module_opt in &config.modules {
@@ -147,13 +156,6 @@ pub fn build_svi_block(
                     relevant_services.push(port.service.clone());
                 }
             }
-        }
-    }
-
-    // Standalone SVI services listed in config.json
-    for svc in &config.svi_services {
-        if seen.insert(svc.clone()) {
-            relevant_services.push(svc.clone());
         }
     }
 
@@ -177,7 +179,25 @@ pub fn build_svi_block(
 
     // Deduplicate by sort key — if multiple services provide the same SVI
     // (e.g., two services both have interface Vlan80), keep only the first.
-    svi_entries.dedup_by_key(|(key, _)| *key);
+    // Warn if the duplicate has different content (indicates a conflict that
+    // should have been resolved at extraction time).
+    {
+        let mut i = 1;
+        while i < svi_entries.len() {
+            if svi_entries[i].0 == svi_entries[i - 1].0 {
+                if svi_entries[i].1.trim() != svi_entries[i - 1].1.trim() {
+                    let (_prio, num) = svi_entries[i].0;
+                    eprintln!(
+                        "warning: duplicate SVI for VLAN {} with different content — keeping first",
+                        num
+                    );
+                }
+                svi_entries.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
 
     let mut output = String::new();
     for ((_prio, _num), content) in &svi_entries {

@@ -359,13 +359,13 @@ fn get_or_create_service(
 
 /// Derive a service name from normalized config lines.
 fn derive_service_name(lines: &[String], counter: &mut usize) -> String {
-    // Access vlan
-    for line in lines {
-        if let Some(rest) = line.strip_prefix("switchport access vlan ") {
-            return format!("access-vlan{}", rest.trim());
-        }
-    }
-    // Channel-group (check before trunk since channel-group ports may also be trunk)
+    // Determine switchport mode first — this drives naming strategy.
+    // IOS keeps `switchport access vlan` even on trunk ports, so we must
+    // check mode before using access vlan for naming.
+    let is_trunk = lines.iter().any(|l| l == "switchport mode trunk");
+    let is_access = lines.iter().any(|l| l == "switchport mode access");
+
+    // Channel-group (check first since channel-group ports may also be trunk)
     for line in lines {
         if let Some(rest) = line.strip_prefix("channel-group ") {
             let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -373,18 +373,25 @@ fn derive_service_name(lines: &[String], counter: &mut usize) -> String {
         }
     }
     // Trunk: check for allowed vlan or just trunk mode
-    let is_trunk = lines.iter().any(|l| l == "switchport mode trunk");
-    for line in lines {
-        if let Some(rest) = line.strip_prefix("switchport trunk allowed vlan ") {
-            let vlan_part = rest.trim().replace(',', "-");
-            if vlan_part == "all" {
-                return "trunk-all".to_string();
-            }
-            return format!("trunk-vlan{}", vlan_part);
-        }
-    }
     if is_trunk {
+        for line in lines {
+            if let Some(rest) = line.strip_prefix("switchport trunk allowed vlan ") {
+                let vlan_part = rest.trim().replace(',', "-");
+                if vlan_part == "all" {
+                    return "trunk-all".to_string();
+                }
+                return format!("trunk-vlan{}", vlan_part);
+            }
+        }
         return "trunk-all".to_string();
+    }
+    // Access vlan (only if actually in access mode or no explicit mode)
+    if is_access || !is_trunk {
+        for line in lines {
+            if let Some(rest) = line.strip_prefix("switchport access vlan ") {
+                return format!("access-vlan{}", rest.trim());
+            }
+        }
     }
     // Shutdown-only
     if lines == &["shutdown"] {

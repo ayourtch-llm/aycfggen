@@ -251,6 +251,12 @@ mod tests {
         fn load_svi_config(&self, _service_name: &str) -> Result<Option<String>> {
             Ok(None)
         }
+
+        fn list_services(&self) -> Result<Vec<String>> {
+            let mut names: Vec<String> = self.services.iter().cloned().collect();
+            names.sort();
+            Ok(names)
+        }
     }
 
     struct MockTemplateSource {
@@ -320,6 +326,12 @@ mod tests {
             } else {
                 anyhow::bail!("config element '{}' not found", element_name)
             }
+        }
+
+        fn list_elements(&self) -> Result<Vec<String>> {
+            let mut names: Vec<String> = self.elements.iter().cloned().collect();
+            names.sort();
+            Ok(names)
         }
     }
 

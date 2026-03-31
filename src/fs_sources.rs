@@ -116,6 +116,26 @@ impl ServiceSource for FsServiceSource {
             .with_context(|| format!("failed to read svi-config.txt for service {:?}: {}", service_name, path.display()))?;
         Ok(Some(normalize_trailing_newline(&data)))
     }
+
+    fn list_services(&self) -> Result<Vec<String>> {
+        let entries = std::fs::read_dir(&self.dir)
+            .with_context(|| format!("failed to read services directory: {}", self.dir.display()))?;
+        let mut names: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to read entry in {}", self.dir.display()))?;
+            if entry.file_type()
+                .with_context(|| format!("failed to get file type for {:?}", entry.path()))?
+                .is_dir()
+            {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +181,26 @@ impl ConfigElementSource for FsConfigElementSource {
         let data = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read apply.txt for element {:?}: {}", element_name, path.display()))?;
         Ok(normalize_trailing_newline(&data))
+    }
+
+    fn list_elements(&self) -> Result<Vec<String>> {
+        let entries = std::fs::read_dir(&self.dir)
+            .with_context(|| format!("failed to read config-elements directory: {}", self.dir.display()))?;
+        let mut names: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .with_context(|| format!("failed to read entry in {}", self.dir.display()))?;
+            if entry.file_type()
+                .with_context(|| format!("failed to get file type for {:?}", entry.path()))?
+                .is_dir()
+            {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 }
 
@@ -327,6 +367,40 @@ mod tests {
         assert!(content.contains("logging buffered"));
         assert!(content.ends_with('\n'));
         assert!(!content.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_list_elements_set1() {
+        let source = FsConfigElementSource::new(set1_dir().join("config-elements"));
+        let mut elements = source.list_elements().expect("list elements");
+        elements.sort();
+        assert_eq!(elements, vec!["logging-standard"]);
+    }
+
+    #[test]
+    fn test_list_elements_set2() {
+        let source = FsConfigElementSource::new(set2_dir().join("config-elements"));
+        let mut elements = source.list_elements().expect("list elements");
+        elements.sort();
+        assert_eq!(elements, vec!["ntp-config"]);
+    }
+
+    // --- FsServiceSource listing ---
+
+    #[test]
+    fn test_list_services_set1() {
+        let source = FsServiceSource::new(set1_dir().join("services"));
+        let mut services = source.list_services().expect("list services");
+        services.sort();
+        assert_eq!(services, vec!["access-vlan10", "trunk"]);
+    }
+
+    #[test]
+    fn test_list_services_set2() {
+        let source = FsServiceSource::new(set2_dir().join("services"));
+        let mut services = source.list_services().expect("list services");
+        services.sort();
+        assert_eq!(services, vec!["voice", "wan-link"]);
     }
 
     // --- FsSoftwareImageSource ---

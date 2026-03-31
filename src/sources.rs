@@ -13,6 +13,7 @@ pub trait LogicalDeviceSource {
 pub trait ServiceSource {
     fn load_port_config(&self, service_name: &str) -> Result<String>;
     fn load_svi_config(&self, service_name: &str) -> Result<Option<String>>;
+    fn list_services(&self) -> Result<Vec<String>>;
 }
 
 pub trait ConfigTemplateSource {
@@ -21,6 +22,7 @@ pub trait ConfigTemplateSource {
 
 pub trait ConfigElementSource {
     fn load_apply(&self, element_name: &str) -> Result<String>;
+    fn list_elements(&self) -> Result<Vec<String>>;
 }
 
 pub trait SoftwareImageSource {

@@ -7,7 +7,7 @@ use crate::sources::{
     LogicalDeviceSource, ServiceSource, SoftwareImageSource,
 };
 use crate::validate::validate_device;
-use crate::interface_name::{derive_interface_name, resolve_slot_index_base};
+use crate::interface_name::{derive_interface_name_for_port_id, resolve_slot_index_base};
 
 /// Expand !!!###<element-name> markers in a template.
 /// Each marker must be the entire content of a line (trimmed).
@@ -70,18 +70,16 @@ pub fn build_port_block(
         }
 
         for port_assignment in &module.ports {
-            let port_def = hw_template.ports.get(&port_assignment.name)
-                .ok_or_else(|| anyhow::anyhow!(
-                    "port {:?} not found in hardware template for SKU {:?}",
-                    port_assignment.name, module.sku
-                ))?;
-
-            let iface_name = derive_interface_name(
-                port_def,
+            let iface_name = derive_interface_name_for_port_id(
+                &port_assignment.name,
+                &hw_template,
                 slot_position,
                 slot_index_base,
                 config.omit_slot_prefix,
-            );
+            ).map_err(|e| anyhow::anyhow!(
+                "port {:?} not found in hardware template for SKU {:?}: {}",
+                port_assignment.name, module.sku, e
+            ))?;
 
             let port_config = service_source.load_port_config(&port_assignment.service)?;
 
@@ -310,6 +308,11 @@ mod tests {
             self.elements.get(name).cloned()
                 .ok_or_else(|| anyhow::anyhow!("element not found: {}", name))
         }
+        fn list_elements(&self) -> Result<Vec<String>> {
+            let mut names: Vec<String> = self.elements.keys().cloned().collect();
+            names.sort();
+            Ok(names)
+        }
     }
 
     fn mock_source_with(name: &str, content: &str) -> MockElementSource {
@@ -434,6 +437,11 @@ mod tests {
         }
         fn load_svi_config(&self, name: &str) -> Result<Option<String>> {
             Ok(self.svi_configs.get(name).cloned())
+        }
+        fn list_services(&self) -> Result<Vec<String>> {
+            let mut names: Vec<String> = self.port_configs.keys().cloned().collect();
+            names.sort();
+            Ok(names)
         }
     }
 
@@ -595,6 +603,109 @@ mod tests {
         assert!(!warnings.is_empty(), "should have at least one warning");
         assert!(warnings[0].contains("zero ports") || warnings[0].contains("EMPTY-SKU"),
             "warning should mention zero ports or SKU: {}", warnings[0]);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 8b: Sub-interface port block tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_build_port_block_sub_interface_omit_slot() {
+        // Port0.100 on omit-slot device → GigabitEthernet0/0.100
+        let mut ports = IndexMap::new();
+        ports.insert("Port0".to_string(), PortDefinition {
+            name: "GigabitEthernet".to_string(),
+            index: "0/0".to_string(),
+        });
+        let hw_tmpl = HardwareTemplate { vendor: None, slot_index_base: None, ports };
+        let mut templates = HashMap::new();
+        templates.insert("MY-SKU".to_string(), hw_tmpl);
+
+        let port_assignment = PortAssignment {
+            name: "Port0.100".to_string(),
+            service: "sub-iface-svc".to_string(),
+            prologue: None,
+            epilogue: None,
+            vars: IndexMap::new(),
+        };
+        let module = Module {
+            sku: "MY-SKU".to_string(),
+            serial: None,
+            ports: vec![port_assignment],
+        };
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: true,
+            slot_index_base: None,
+            vars: IndexMap::new(),
+            modules: vec![Some(module)],
+        };
+
+        let hw_source = MockHwSource { templates };
+        let mut port_configs = HashMap::new();
+        port_configs.insert("sub-iface-svc".to_string(), "encapsulation dot1q 100\n".to_string());
+        let service_source = MockServiceSource { port_configs, svi_configs: HashMap::new() };
+
+        let (port_block, warnings) = build_port_block(&config, &hw_source, &service_source)
+            .expect("build_port_block with sub-interface");
+        assert!(warnings.is_empty(), "no warnings expected: {:?}", warnings);
+        assert!(
+            port_block.contains("interface GigabitEthernet0/0.100\n"),
+            "expected interface GigabitEthernet0/0.100, got:\n{}", port_block
+        );
+    }
+
+    #[test]
+    fn test_build_port_block_sub_interface_with_slot() {
+        // Port0.100 on multi-module device at slot_position=1 → GigabitEthernet1/0/0.100
+        let mut ports = IndexMap::new();
+        ports.insert("Port0".to_string(), PortDefinition {
+            name: "GigabitEthernet".to_string(),
+            index: "0/0".to_string(),
+        });
+        let hw_tmpl = HardwareTemplate { vendor: None, slot_index_base: None, ports };
+        let mut templates = HashMap::new();
+        templates.insert("MY-SKU".to_string(), hw_tmpl);
+
+        let port_assignment = PortAssignment {
+            name: "Port0.100".to_string(),
+            service: "sub-iface-svc".to_string(),
+            prologue: None,
+            epilogue: None,
+            vars: IndexMap::new(),
+        };
+        // slot_position=1 means the module is the second element (first is None)
+        let module = Module {
+            sku: "MY-SKU".to_string(),
+            serial: None,
+            ports: vec![port_assignment],
+        };
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: false,
+            slot_index_base: Some(0),
+            vars: IndexMap::new(),
+            modules: vec![None, Some(module)],
+        };
+
+        let hw_source = MockHwSource { templates };
+        let mut port_configs = HashMap::new();
+        port_configs.insert("sub-iface-svc".to_string(), "encapsulation dot1q 100\n".to_string());
+        let service_source = MockServiceSource { port_configs, svi_configs: HashMap::new() };
+
+        let (port_block, warnings) = build_port_block(&config, &hw_source, &service_source)
+            .expect("build_port_block with sub-interface slot");
+        assert!(warnings.is_empty(), "no warnings expected: {:?}", warnings);
+        assert!(
+            port_block.contains("interface GigabitEthernet1/0/0.100\n"),
+            "expected interface GigabitEthernet1/0/0.100, got:\n{}", port_block
+        );
     }
 
     // -------------------------------------------------------------------------

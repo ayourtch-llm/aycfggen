@@ -86,39 +86,35 @@ impl ResolvedExtractDirs {
 pub enum Target {
     LiveDevice(std::net::IpAddr),
     OfflineFile(PathBuf),
+    OfflineDir(PathBuf),
 }
 
 pub fn classify_target(target: &str) -> Target {
     if let Ok(addr) = target.parse::<std::net::IpAddr>() {
         Target::LiveDevice(addr)
     } else {
-        Target::OfflineFile(PathBuf::from(target))
+        let path = PathBuf::from(target);
+        if path.is_dir() {
+            Target::OfflineDir(path)
+        } else {
+            Target::OfflineFile(path)
+        }
     }
 }
 
 // ─── run_extract_offline ──────────────────────────────────────────────────────
 
 /// Run extraction for a single offline target (file path).
-/// For live devices, this would connect via SSH — not implemented yet.
+///
+/// Handles both single-device command dumps and multi-device terminal session logs.
+/// Multi-device files are split by hostname from IOS prompts, and each device
+/// is extracted independently.
 pub fn run_extract_offline(
     file_path: &std::path::Path,
     dirs: &ResolvedExtractDirs,
     save_commands_path: Option<&std::path::Path>,
     recreate_hw: bool,
 ) -> Result<()> {
-    use crate::extract::extract_device;
-    use crate::fs_sinks::{
-        FsHardwareTemplateSink, FsServiceSink, FsConfigTemplateSink,
-        FsConfigElementSink, FsLogicalDeviceSink,
-    };
-    use crate::fs_sources::{FsServiceSource, FsConfigElementSource};
-    use crate::sinks::{
-        HardwareTemplateSink, ServiceSink, ConfigTemplateSink,
-        ConfigElementSink, LogicalDeviceSink,
-    };
-    use crate::sources::{ServiceSource, ConfigElementSource};
-    use std::collections::HashMap;
-
     // Read the entire command dump
     let content = std::fs::read_to_string(file_path)
         .map_err(|e| anyhow::anyhow!("failed to read command dump {:?}: {}", file_path, e))?;
@@ -133,12 +129,69 @@ pub fn run_extract_offline(
             .map_err(|e| anyhow::anyhow!("failed to save command dump to {:?}: {}", save_path, e))?;
     }
 
-    // Split the dump into sections by our markers, or fall back to passing everything.
-    let sections = split_command_dump(&content);
-    let show_version_output: &str = sections.get("show version").map(String::as_str).unwrap_or(&content);
-    let show_inventory_output: &str = sections.get("show inventory").map(String::as_str).unwrap_or(&content);
-    let show_ip_brief_output: &str = sections.get("show ip interface brief").map(String::as_str).unwrap_or(&content);
-    let show_running_config: &str = sections.get("show running-config").map(String::as_str).unwrap_or(&content);
+    // Split into per-device sections
+    let per_device = split_command_dump_multi(&content);
+
+    if per_device.is_empty() {
+        // No commands detected at all — try single-device fallback with raw content
+        return run_extract_sections(&content, &HashMap::new(), dirs, recreate_hw);
+    }
+
+    let device_count = per_device.len();
+    for (hostname, sections) in &per_device {
+        // Skip devices that don't have at least show version and show running-config
+        let has_version = sections.contains_key("show version");
+        let has_running = sections.contains_key("show running-config");
+        if !has_version || !has_running {
+            if device_count > 1 {
+                eprintln!(
+                    "Skipping device '{}': missing {} (have: {})",
+                    hostname,
+                    if !has_version && !has_running {
+                        "show version and show running-config"
+                    } else if !has_version {
+                        "show version"
+                    } else {
+                        "show running-config"
+                    },
+                    sections.keys().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
+            continue;
+        }
+
+        if device_count > 1 {
+            eprintln!("Processing device: {}", hostname);
+        }
+        run_extract_sections(&content, sections, dirs, recreate_hw)?;
+    }
+
+    Ok(())
+}
+
+/// Run the extraction pipeline for a single device given its command sections.
+fn run_extract_sections(
+    full_content: &str,
+    sections: &HashMap<String, String>,
+    dirs: &ResolvedExtractDirs,
+    recreate_hw: bool,
+) -> Result<()> {
+    use crate::extract::extract_device;
+    use crate::fs_sinks::{
+        FsHardwareTemplateSink, FsServiceSink, FsConfigTemplateSink,
+        FsConfigElementSink, FsLogicalDeviceSink,
+    };
+    use crate::fs_sources::{FsServiceSource, FsConfigElementSource};
+    use crate::sinks::{
+        HardwareTemplateSink, ServiceSink, ConfigTemplateSink,
+        ConfigElementSink, LogicalDeviceSink,
+    };
+    use crate::sources::{ServiceSource, ConfigElementSource};
+
+    let show_version_output: &str = sections.get("show version").map(String::as_str).unwrap_or(full_content);
+    let show_inventory_output: &str = sections.get("show inventory").map(String::as_str).unwrap_or(full_content);
+    let show_ip_brief_output: &str = sections.get("show ip interface brief").map(String::as_str).unwrap_or(full_content);
+    let show_running_config: &str = sections.get("show running-config").map(String::as_str).unwrap_or(full_content);
 
     // Load existing services from the data store
     let service_source = FsServiceSource::new(dirs.services.clone());
@@ -245,7 +298,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "show running-config",
 ];
 
-/// Split a command dump file into sections.
+/// Split a command dump file into sections (single-device).
 ///
 /// Recognizes section boundaries in multiple formats:
 /// - `!!! aycfgextract: <command> !!!` (our own marker format)
@@ -255,24 +308,49 @@ const KNOWN_COMMANDS: &[&str] = &[
 ///
 /// Returns a map of command name → section content.
 /// If no markers are found, returns an empty map (caller falls back to full content).
+#[cfg(test)]
 fn split_command_dump(content: &str) -> HashMap<String, String> {
-    let mut sections: HashMap<String, String> = HashMap::new();
+    let multi = split_command_dump_multi(content);
+    // Flatten: if there's only one device (or no device tracking), merge all sections.
+    // If there are multiple devices, this returns the *last* device's sections
+    // (backwards-compatible with old behavior).
+    let mut result = HashMap::new();
+    for (_hostname, sections) in multi {
+        result.extend(sections);
+    }
+    result
+}
+
+/// Split a command dump file into per-device sections.
+///
+/// Returns a map of device hostname → (command name → section content).
+/// Hostname is derived from IOS prompts (e.g. `SWITCH-01#sh ver` → hostname "SWITCH-01").
+/// For files using `!!! aycfgextract:` markers (no hostname in prompt), a single
+/// entry with key "" is returned.
+///
+/// If the same command appears multiple times for a device, the last occurrence wins.
+pub fn split_command_dump_multi(content: &str) -> indexmap::IndexMap<String, HashMap<String, String>> {
+    let mut devices: indexmap::IndexMap<String, HashMap<String, String>> = indexmap::IndexMap::new();
+    let mut current_hostname = String::new();
     let mut current_cmd: Option<String> = None;
     let mut current_lines: Vec<&str> = Vec::new();
 
     for line in content.lines() {
-        // Try to detect a command line
-        if let Some(cmd) = detect_command_line(line) {
-            // Flush previous section — only if it has non-empty content.
-            // Empty sections occur when the user types partial/cancelled commands
-            // (tab completion, typos) that produce consecutive prompt lines.
+        if let Some((hostname_opt, cmd)) = detect_command_with_hostname(line) {
+            // Flush previous section
             if let Some(prev_cmd) = current_cmd.take() {
                 let content_text = current_lines.join("\n");
                 let has_content = content_text.lines().any(|l| !l.trim().is_empty());
                 if has_content {
-                    sections.insert(prev_cmd, content_text);
+                    devices.entry(current_hostname.clone())
+                        .or_default()
+                        .insert(prev_cmd, content_text);
                 }
                 current_lines.clear();
+            }
+            // Update hostname if the prompt provided one
+            if let Some(h) = hostname_opt {
+                current_hostname = h;
             }
             current_cmd = Some(cmd);
         } else if current_cmd.is_some() {
@@ -285,21 +363,30 @@ fn split_command_dump(content: &str) -> HashMap<String, String> {
         let content_text = current_lines.join("\n");
         let has_content = content_text.lines().any(|l| !l.trim().is_empty());
         if has_content {
-            sections.insert(cmd, content_text);
+            devices.entry(current_hostname)
+                .or_default()
+                .insert(cmd, content_text);
         }
     }
 
-    sections
+    devices
 }
 
 /// Detect if a line is a command marker/prompt, returning the normalized command name.
+#[cfg(test)]
 fn detect_command_line(line: &str) -> Option<String> {
+    detect_command_with_hostname(line).map(|(_hostname, cmd)| cmd)
+}
+
+/// Detect if a line is a command marker/prompt, returning (hostname, command).
+/// The hostname is `None` for marker-format lines or bare commands.
+fn detect_command_with_hostname(line: &str) -> Option<(Option<String>, String)> {
     let trimmed = line.trim();
 
     // Format 1: !!! aycfgextract: <command> !!!
     if let Some(rest) = trimmed.strip_prefix("!!! aycfgextract: ") {
         let cmd = rest.strip_suffix(" !!!").unwrap_or(rest);
-        return Some(cmd.to_string());
+        return Some((None, cmd.to_string()));
     }
 
     // Format 2: hostname#command or hostname>command (IOS prompt)
@@ -308,14 +395,21 @@ fn detect_command_line(line: &str) -> Option<String> {
         if let Some(pos) = trimmed.find(sep) {
             let after_prompt = trimmed[pos + 1..].trim();
             if let Some(cmd) = match_command(after_prompt) {
-                return Some(cmd);
+                let hostname = &trimmed[..pos];
+                // Only treat as hostname if it looks like one (alphanumeric + hyphens + underscores)
+                if !hostname.is_empty()
+                    && hostname.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Some((Some(hostname.to_string()), cmd));
+                }
+                return Some((None, cmd));
             }
         }
     }
 
     // Format 3: bare command on a line by itself
     if let Some(cmd) = match_command(trimmed) {
-        return Some(cmd);
+        return Some((None, cmd));
     }
 
     None
@@ -473,7 +567,7 @@ mod tests {
             Target::LiveDevice(addr) => {
                 assert_eq!(addr.to_string(), "192.168.1.1");
             }
-            Target::OfflineFile(_) => panic!("Expected LiveDevice for IPv4 address"),
+            other => panic!("Expected LiveDevice for IPv4 address, got {:?}", other),
         }
     }
 
@@ -484,7 +578,7 @@ mod tests {
             Target::LiveDevice(addr) => {
                 assert_eq!(addr.to_string(), "2001:db8::1");
             }
-            Target::OfflineFile(_) => panic!("Expected LiveDevice for IPv6 address"),
+            other => panic!("Expected LiveDevice for IPv6 address, got {:?}", other),
         }
     }
 
@@ -495,7 +589,7 @@ mod tests {
             Target::OfflineFile(path) => {
                 assert_eq!(path, PathBuf::from("/tmp/device-dump.txt"));
             }
-            Target::LiveDevice(_) => panic!("Expected OfflineFile for file path"),
+            other => panic!("Expected OfflineFile for file path, got {:?}", other),
         }
     }
 
@@ -506,7 +600,7 @@ mod tests {
             Target::OfflineFile(path) => {
                 assert_eq!(path, PathBuf::from("dumps/switch1.txt"));
             }
-            Target::LiveDevice(_) => panic!("Expected OfflineFile for relative path"),
+            other => panic!("Expected OfflineFile for relative path, got {:?}", other),
         }
     }
 
@@ -518,7 +612,7 @@ mod tests {
             Target::OfflineFile(path) => {
                 assert_eq!(path, PathBuf::from("myswitch"));
             }
-            Target::LiveDevice(_) => panic!("Expected OfflineFile for hostname string"),
+            other => panic!("Expected OfflineFile for hostname string, got {:?}", other),
         }
     }
 
@@ -690,5 +784,141 @@ end
         let ip_brief = sections.get("show ip interface brief").unwrap();
         assert!(ip_brief.contains("IP-Address"), "should contain IP-Address header");
         assert!(!ip_brief.contains("Status"), "should not contain status table header");
+    }
+
+    #[test]
+    fn test_detect_command_with_hostname() {
+        // Prompt with hostname
+        assert_eq!(
+            detect_command_with_hostname("SWITCH-01#sh ver"),
+            Some((Some("SWITCH-01".into()), "show version".into()))
+        );
+        // Marker format (no hostname)
+        assert_eq!(
+            detect_command_with_hostname("!!! aycfgextract: show version !!!"),
+            Some((None, "show version".into()))
+        );
+        // Non-command prompt (bare hostname or non-command after #)
+        assert_eq!(
+            detect_command_with_hostname("SWITCH-01#"),
+            None
+        );
+        assert_eq!(
+            detect_command_with_hostname("SWITCH-01#term len 0"),
+            None
+        );
+        // False positive: "Device#   PID" from show version output
+        assert_eq!(
+            detect_command_with_hostname("Device#   PID                   SN"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_split_command_dump_multi_single_device() {
+        let dump = "\
+SWITCH#sh ver
+Cisco IOS Software version 15.2
+SWITCH#sh run
+hostname SWITCH
+end
+";
+        let devices = split_command_dump_multi(dump);
+        assert_eq!(devices.len(), 1, "should have 1 device");
+        assert!(devices.contains_key("SWITCH"), "device should be SWITCH");
+        let sections = &devices["SWITCH"];
+        assert!(sections.contains_key("show version"));
+        assert!(sections.contains_key("show running-config"));
+    }
+
+    #[test]
+    fn test_split_command_dump_multi_two_devices() {
+        let dump = "\
+CORE#sh ver
+Cisco IOS version 15.2
+Core switch
+CORE#sh run
+hostname CORE
+interface Vlan1
+end
+SW-REMOTE#sh ver
+Cisco IOS version 12.2
+Remote switch
+SW-REMOTE#sh inv
+NAME: \"1\", DESCR: \"WS-C3560\"
+PID: WS-C3560 , SN: FOC123
+SW-REMOTE#sh run
+hostname SW-REMOTE
+interface GigabitEthernet0/1
+end
+";
+        let devices = split_command_dump_multi(dump);
+        assert_eq!(devices.len(), 2, "should have 2 devices");
+
+        // CORE device
+        assert!(devices.contains_key("CORE"), "should have CORE");
+        let core = &devices["CORE"];
+        assert!(core.contains_key("show version"));
+        assert!(core["show version"].contains("Core switch"));
+        assert!(core.contains_key("show running-config"));
+        assert!(core["show running-config"].contains("hostname CORE"));
+
+        // SW-REMOTE device
+        assert!(devices.contains_key("SW-REMOTE"), "should have SW-REMOTE");
+        let remote = &devices["SW-REMOTE"];
+        assert!(remote.contains_key("show version"));
+        assert!(remote["show version"].contains("Remote switch"));
+        assert!(remote.contains_key("show inventory"));
+        assert!(remote.contains_key("show running-config"));
+        assert!(remote["show running-config"].contains("hostname SW-REMOTE"));
+    }
+
+    #[test]
+    fn test_split_command_dump_multi_with_noise_between_devices() {
+        // Simulates terminal session: login to CORE, telnet to REMOTE
+        let dump = "\
+Password:
+CORE#
+CORE#sh ver
+Core version output
+CORE#192.168.1.1
+Trying 192.168.1.1 ... Open
+CC
+Banner text here
+Username: admin
+Password:
+REMOTE#
+REMOTE#sh ver
+Remote version output
+REMOTE#sh run
+hostname REMOTE
+end
+";
+        let devices = split_command_dump_multi(dump);
+        assert_eq!(devices.len(), 2, "should have 2 devices, got: {:?}", devices.keys().collect::<Vec<_>>());
+        assert!(devices.contains_key("CORE"));
+        assert!(devices.contains_key("REMOTE"));
+        // CORE's show version should contain "Core version output", not the noise
+        assert!(devices["CORE"]["show version"].contains("Core version output"));
+        // REMOTE's show version should contain "Remote version output"
+        assert!(devices["REMOTE"]["show version"].contains("Remote version output"));
+    }
+
+    #[test]
+    fn test_split_command_dump_multi_duplicate_commands_last_wins() {
+        let dump = "\
+SWITCH#sh ver
+First version output
+SWITCH#sh ver
+Second version output (corrected)
+SWITCH#sh run
+hostname SWITCH
+end
+";
+        let devices = split_command_dump_multi(dump);
+        let sections = &devices["SWITCH"];
+        // Second occurrence should win
+        assert!(sections["show version"].contains("Second version output"));
+        assert!(!sections["show version"].contains("First version output"));
     }
 }

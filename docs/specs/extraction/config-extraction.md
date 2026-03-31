@@ -19,8 +19,11 @@ aycfgextract [OPTIONS] <TARGET>...
 ```
 
 Where `<TARGET>` is one or more of:
-- IPv4/IPv6 addresses of live devices
+- IPv4 addresses of live devices
+- IPv6 addresses of live devices
 - Paths to text files containing saved command output (offline mode)
+
+The extractor distinguishes targets by format: valid IPv4/IPv6 addresses are treated as live devices; everything else is treated as a file path.
 
 ### Directory Options
 
@@ -35,7 +38,7 @@ Where `<TARGET>` is one or more of:
 ### Extraction Options
 
 - `--recreate-hardware-profiles` — force recreation of hardware profiles even if they already exist for the discovered SKU
-- `--offline <FILE>` — read command output from a text file instead of connecting to a live device
+- `--save-commands <PATH>` — override the default save location for collected command output (default: `/tmp/<hostname>-<serial>-import.txt`)
 
 ### Credentials
 
@@ -54,16 +57,18 @@ For each target device, the following commands are executed (or parsed from an o
 
 - `show version` — platform identification, software version, software image filename
 - `show inventory` — PIDs (SKUs), serial numbers, slot positions
-- `show ip interface brief` (or `show interfaces status`) — enumerate all interface names
+- `show ip interface brief` — enumerate all interface names (primary source for interface enumeration)
+- `show interfaces status` — additional interface data (speed, duplex, media type); also run for future use
 - `show running-config` — full device configuration
 
-In live mode, all commands are executed in a single session. The full command output is always saved so that extraction can be re-run offline.
+In live mode, all commands are executed in a single session. The full command output is **always saved** to `/tmp/<hostname>-<serial>-import.txt` (or the path specified by `--save-commands`) so that extraction can be re-run offline. This file can be shared with others for offline import.
 
 ### Offline Mode
 
-The extractor accepts a text file containing the concatenated output of the above commands. This enables:
+The extractor accepts a text file containing the concatenated output of the above commands as a `<TARGET>` argument. This enables:
 - Testing and CI without live devices
 - Re-running extraction with improved heuristics
+- Sharing device data for remote analysis
 - Round-trip unit tests (the primary correctness validation)
 
 ## Extraction Pipeline
@@ -76,16 +81,19 @@ The extraction proceeds in six stages:
 
 **Process:**
 
-1. Parse `show inventory` to identify PIDs (SKUs) and serial numbers per slot
-2. Parse interface names from `show ip interface brief`, extract slot numbers, and group interfaces by slot/module
-3. Match each slot's interfaces to its PID from inventory
-4. Determine slot configuration:
+1. Determine module count from `show inventory` first — this controls interface name parsing
+2. Parse `show inventory` to identify PIDs (SKUs) and serial numbers per slot
+3. Parse interface names from `show ip interface brief`, using the module count to determine whether interface names include a slot prefix
+4. Extract slot numbers and group interfaces by slot/module
+5. Match each slot's interfaces to its PID from inventory
+6. Determine slot configuration:
    - `omit-slot-prefix: true` — only when there is exactly one module and interface names contain no slot prefix
    - `slot-index-base` — the lowest slot number observed in the interface names
-5. For stacked switches (multiple slots with the same PID but different serials): one shared hardware profile, multiple modules in the device config each with its own serial
-6. Extract the software image filename from `show version` output for the `software-image` field in the device config
+7. For stacked switches (multiple slots with the same PID but different serials): one shared hardware profile, multiple modules in the device config each with its own serial
+8. For mixed stacks (different slots with different PIDs): each slot gets its own hardware profile
+9. Extract the software image filename from `show version` output for the `software-image` field in the device config
 
-**Interface name reverse-parsing:** Given an interface name like `GigabitEthernet1/0/3`, the parser splits it by matching known Cisco interface name prefixes (`GigabitEthernet`, `FastEthernet`, `TenGigabitEthernet`, `TwentyFiveGigE`, `FortyGigabitEthernet`, `HundredGigE`, `Serial`, `Loopback`, `Vlan`, `Port-channel`, `Tunnel`, etc.). After stripping the prefix, the first number segment is the slot (if multi-module), and the remainder is the port index. This prefix list must be extensible for future platforms.
+**Interface name reverse-parsing:** Given an interface name like `GigabitEthernet1/0/3`, the parser splits it by matching known Cisco interface name prefixes (`GigabitEthernet`, `FastEthernet`, `TenGigabitEthernet`, `TwentyFiveGigE`, `FortyGigabitEthernet`, `HundredGigE`, `Serial`, `Loopback`, `Vlan`, `Port-channel`, `Tunnel`, etc.). After stripping the prefix, the first number segment is the slot (if multi-module), and the remainder is the port index. The module count from `show inventory` determines whether the first number is a slot or part of the port index. This prefix list must be extensible for future platforms.
 
 **Output:** For each unique SKU, a `ports.json` file in the hardware templates directory (if one does not already exist, or if `--recreate-hardware-profiles` is set).
 
@@ -93,19 +101,19 @@ The `ports.json` structure maps port identifiers to interface name components, d
 
 ### Stage 2: Port Configuration Decomposition
 
-**Input:** `show running-config` (physical interface sections), existing services in the data store
+**Input:** `show running-config` (interface sections), existing services in the data store
 
 **Process:**
 
-1. **Parse** all physical `interface <name>` blocks from the running config, excluding:
-   - SVIs (`interface Vlan*`)
-   - Loopback interfaces (`interface Loopback*`)
-   - Tunnel interfaces (`interface Tunnel*`)
-   - Port-channel interfaces (`interface Port-channel*`)
-   - Sub-interfaces (`interface <name>.<number>`) — see "Sub-interfaces" below
+1. **Parse** all `interface <name>` blocks from the running config. Classify each as:
+   - **Physical port**: `GigabitEthernet0/0`, `FastEthernet0/1`, etc. — enters port grouping
+   - **Sub-interface**: `GigabitEthernet0/0.100`, etc. — modeled as `Port0.100` in port assignments, enters port grouping
+   - **SVI**: `interface Vlan*` — handled in Stage 3
+   - **Virtual**: `Loopback*`, `Tunnel*`, `Port-channel*`, etc. — handled in Stage 4 (literal text in config template)
 2. **Group by structural identity** — ports are in different groups if they differ in:
    - `switchport mode` (access vs. trunk vs. routed)
    - VLAN assignment (`switchport access vlan`, `switchport trunk allowed vlan`, etc.)
+   - `channel-group` membership (ports in a port-channel always form a separate service)
    - These structural differences **always** result in separate services
    - All other line differences are treated as deviations within the group
 3. **Within each group**, identify the most common configuration — this becomes the **service template** (`port-config.txt`)
@@ -113,9 +121,13 @@ The `ports.json` structure maps port identifiers to interface name components, d
    - If a deviation is shared by **3 or more ports**, promote it to a **new service** (split the group)
    - If a deviation is shared by **fewer than 3 ports**, express it as **prologue/epilogue** on the base service
    - Epilogue can overwrite service config lines, so order matters: prologue comes before service config, epilogue after
-   - To determine prologue vs. epilogue: diff each port's interface block against the service template. Lines that appear before the first matching service line are prologue; lines that appear after the last matching service line are epilogue
    - A "deviation" is defined as the exact set of differing lines. Ports must share the identical deviation set to count toward the 3-port threshold
-5. **Match against existing services** — if an existing service's `port-config.txt` matches a derived service template exactly, reuse it instead of creating a new one
+5. **Prologue/epilogue determination:** Use sorted versions of config lines for comparison purposes, but track the original line order. If the difference can be expressed as a clean prepend (prologue) and/or append (epilogue) in the original unsorted order, do that. If the lines are reordered or interleaved in a way that does not decompose cleanly into prologue + service + epilogue, create a new service instead.
+6. **Shutdown port handling:** Ports with `shutdown` in their config are matched using a three-step priority:
+   - **Step 1: Exact match** — try matching the full config (including `shutdown`) against existing services. If it matches, use it as-is
+   - **Step 2: Strip and re-match** — if no exact match, strip the `shutdown` line, match against services normally, and add `shutdown` as epilogue
+   - **Step 3: Shutdown-only** — ports whose only config line is `shutdown` match or create a `shutdown` service
+7. **Match against existing services** — if an existing service's `port-config.txt` matches a derived service template exactly, reuse it instead of creating a new one
 
 **Output:** Service directories (new or matched) and port assignments for the device config.
 
@@ -135,18 +147,18 @@ The `ports.json` structure maps port identifiers to interface name components, d
 
 ### Stage 4: Global Configuration & Config Elements
 
-**Input:** `show running-config` (all non-physical-port sections), existing config elements in the data store
+**Input:** `show running-config` (all non-port, non-sub-interface, non-SVI sections), existing config elements in the data store
 
 **Process:**
 
-1. Extract all global configuration lines — everything outside of physical port `interface` blocks
-2. This includes virtual interface blocks (Loopback, Tunnel, Port-channel) and sub-interfaces, which are kept as literal text in the config template (see "Virtual Interfaces" and "Sub-interfaces" below)
-3. **Best-effort matching** against existing config elements: for each config element in the data store, check if its `apply.txt` content appears as a contiguous block in the global config
+1. Extract all global configuration lines — everything outside of physical port, sub-interface, and SVI `interface` blocks
+2. This includes virtual interface blocks (Loopback, Tunnel, Port-channel), which are kept as literal text in the config template (see "Virtual Interfaces" below)
+3. **Config element matching** against existing config elements, processed in **longest-match-first** order: for each config element in the data store (sorted by `apply.txt` length, descending), check if its `apply.txt` content appears as a contiguous block in the global config. Once lines are consumed by a match, they are unavailable to subsequent elements. This prevents a smaller element from "stealing" lines that belong to a larger one.
 4. Matched blocks are replaced with `!!!###<element-name>` markers in the config template
 5. **Unmatched global config lines remain as literal text** in the config template — this guarantees round-trip correctness regardless of config element recognition
 6. Place `<PORTS-CONFIGURATION>` marker where the first physical port interface block appeared in the original running config
 7. Place `<SVI-CONFIGURATION>` marker where the first `interface Vlan*` block appeared in the original running config
-8. When creating new config element directories, include an empty `unapply.txt` with the content `! FIXME - needs to be generated`
+8. When creating new config element directories, include a placeholder `unapply.txt` with the content `! FIXME - needs to be generated`
 
 **Multi-line constructs:** The parser must correctly handle multi-line blocks with non-standard delimiters:
 - `banner motd <delim>...<delim>` — banner text between delimiter characters
@@ -205,12 +217,32 @@ Byte-for-byte comparison between the original `show running-config` and the aycf
 
 **Normalization procedure (applied to both sides before comparison):**
 
-1. Remove all lines that consist solely of `!` optionally followed by whitespace (separator lines)
-2. Remove all lines starting with `! ` that are aycfggen-generated comments (e.g., `! config-element:`, `! PORTS-START`, `! PORTS-END`, `! SVI-START`, `! SVI-END`)
+1. Remove all lines that consist solely of `!` optionally followed by whitespace (bare separator lines)
+2. Remove lines matching these specific aycfggen-generated patterns:
+   - `! config-element: <name>` (config element comment headers)
+   - `! PORTS-START`
+   - `! PORTS-END`
+   - `! SVI-START`
+   - `! SVI-END`
+   - `! use <PORTS-CONFIGURATION> marker` / `! use <SVI-CONFIGURATION> marker` (fallback guidance comments)
 3. Strip trailing whitespace from all remaining lines
 4. Remove trailing blank lines
 
+All other `!`-prefixed comment lines (e.g., `! Access Switch Configuration`) are **preserved** on both sides — they are legitimate config content.
+
 After normalization, the two outputs must be identical.
+
+## Write-Side Trait Abstractions
+
+The existing `sources.rs` traits (`HardwareTemplateSource`, `ServiceSource`, etc.) are read-only. The extraction tool requires write-side counterpart traits to maintain the abstraction pattern:
+
+- `HardwareTemplateSink` — write hardware profiles
+- `ServiceSink` — write service directories (port-config.txt, svi-config.txt)
+- `ConfigTemplateSink` — write config templates
+- `ConfigElementSink` — write config element directories (apply.txt, unapply.txt)
+- `LogicalDeviceSink` — write logical device configs
+
+These mirror the read-side traits and have filesystem implementations. This keeps the extraction pipeline testable with mock backends and consistent with the existing architecture.
 
 ## Logical Device Output
 
@@ -259,9 +291,9 @@ This is a pragmatic choice for the initial implementation. These interfaces do n
 
 ## Sub-interfaces
 
-Sub-interfaces (`GigabitEthernet0/0.100`, etc.) are placed as **literal text in the config template** in the initial implementation.
+Sub-interfaces (`GigabitEthernet0/0.100`, etc.) are modeled as ports with extended naming: `Port0.100` in the hardware profile and port assignments. This allows them to participate in the service model and port grouping (Stage 2), which is natural for router-on-a-stick deployments where multiple sub-interfaces share identical encapsulation + IP assignment patterns.
 
-**Future direction:** Sub-interfaces could be modeled as ports with extended naming (e.g., `Port0.100` in the hardware profile / port assignments), allowing them to participate in the service model. This would be natural for router-on-a-stick deployments where multiple sub-interfaces share identical encapsulation + IP assignment patterns. This is deferred to a future design iteration.
+The sub-interface number (after the `.`) is part of the port identifier, not the slot. For example, `GigabitEthernet1/0/0.100` on a multi-module device has slot=1, port index=`0/0`, sub-interface=100, mapped to `Port0.100` in the module at slot 1.
 
 ## Service Naming Convention
 
@@ -270,6 +302,8 @@ Services created by the extractor follow a naming scheme derived from their stru
 - Access ports: `access-vlan<N>` (e.g., `access-vlan10`)
 - Trunk ports: `trunk-vlan<N>-<N>` or `trunk-all` depending on allowed VLANs
 - Routed ports: `routed-<brief-description>`
+- Port-channel members: `channel-group-<N>` (e.g., `channel-group-1`)
+- Shutdown-only ports: `shutdown`
 - SVI-derived names: `VLAN-SERVICE-<N>` as fallback, or a short identifier extracted from the interface description/comment if one exists
 
 Existing services in the data store are always preferred over creating new ones with these generated names.
@@ -292,8 +326,10 @@ The mockios simulator in `../ayclic/mockios/` generates realistic IOS command ou
 - Interface name reverse-parsing tests
 - Port grouping/clustering algorithm tests
 - Prologue/epilogue derivation tests
-- Config element matching tests
+- Shutdown port matching tests
+- Config element matching tests (including overlap/priority)
 - Round-trip comparison normalization tests
+- Sub-interface modeling tests
 
 ### Integration Tests
 
@@ -312,7 +348,6 @@ Test fixtures live alongside the existing aycfggen example sets in `docs/example
 - **Multi-vendor support:** The extraction pipeline is structured around traits that can be implemented for different vendors (NX-OS, EOS, JunOS, etc.)
 - **Variable extraction activation:** Enable hostname, VLAN ID, and additional variable extractors once aycfggen implements `{{variable}}` expansion
 - **Additional variable extractors:** IP addresses, subnet masks, descriptions, SNMP communities, NTP servers, etc.
-- **Sub-interface modeling:** Extend port naming to `PortX.<N>` for sub-interfaces on physical ports
 - **Incremental extraction:** Re-run extraction on a device that already has a config in the data store, updating only what changed
 - **Config element unapply:** Leverage `unapply.txt` for generating change sets
 - **Multi-device processing order:** When extracting multiple devices, services created by earlier devices are available for matching by later devices (processed sequentially, written to disk after each device)

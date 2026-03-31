@@ -220,6 +220,101 @@ pub fn run_extract_offline(
     Ok(())
 }
 
+// ─── run_extract_live ────────────────────────────────────────────────────────
+
+/// Commands to execute on the device for full extraction.
+const EXTRACTION_COMMANDS: &[&str] = &[
+    "show version",
+    "show inventory",
+    "show ip interface brief",
+    "show interfaces status",
+    "show running-config",
+];
+
+/// Connect to a live device via SSH, collect command output, and run extraction.
+///
+/// Credentials are read from environment variables:
+/// - `AYCFGEXTRACT_SSH_USERNAME`
+/// - `AYCFGEXTRACT_SSH_PASSWORD`
+pub fn run_extract_live(
+    addr: std::net::IpAddr,
+    dirs: &ResolvedExtractDirs,
+    save_commands_path: Option<&std::path::Path>,
+    recreate_hw: bool,
+) -> Result<()> {
+    let username = std::env::var("AYCFGEXTRACT_SSH_USERNAME")
+        .map_err(|_| anyhow::anyhow!("AYCFGEXTRACT_SSH_USERNAME environment variable not set"))?;
+    let password = std::env::var("AYCFGEXTRACT_SSH_PASSWORD")
+        .map_err(|_| anyhow::anyhow!("AYCFGEXTRACT_SSH_PASSWORD environment variable not set"))?;
+
+    // Build a tokio runtime for the async SSH operations
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {}", e))?;
+
+    let collected = rt.block_on(collect_from_device(addr, &username, &password))?;
+
+    // Save the collected output
+    let default_save_path;
+    let save_path = if let Some(p) = save_commands_path {
+        p
+    } else {
+        // Try to extract hostname from collected output for the default path.
+        // Fall back to IP address if hostname can't be determined.
+        let hostname = crate::show_parsers::parse_show_version(&collected)
+            .map(|v| v.hostname)
+            .unwrap_or_else(|| addr.to_string());
+        let serial = crate::show_parsers::parse_show_version(&collected)
+            .map(|v| v.serial_number)
+            .unwrap_or_else(|| "unknown".to_string());
+        default_save_path = std::path::PathBuf::from(format!("/tmp/{}-{}-import.txt", hostname, serial));
+        &default_save_path
+    };
+
+    if let Some(parent) = save_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create save directory: {}", e))?;
+    }
+    std::fs::write(save_path, &collected)
+        .map_err(|e| anyhow::anyhow!("failed to save command dump to {:?}: {}", save_path, e))?;
+    eprintln!("Command output saved to: {}", save_path.display());
+
+    // Now run the offline extraction on the saved file
+    run_extract_offline(save_path, dirs, None, recreate_hw)
+}
+
+/// Connect to a device via SSH and collect all extraction commands.
+async fn collect_from_device(
+    addr: std::net::IpAddr,
+    username: &str,
+    password: &str,
+) -> Result<String> {
+    use ayclic::{CiscoIosConn, ConnectionType};
+
+    let target = addr.to_string();
+    eprintln!("Connecting to {} via SSH...", target);
+
+    let mut conn = CiscoIosConn::new(&target, ConnectionType::Ssh, username, password)
+        .await
+        .map_err(|e| anyhow::anyhow!("SSH connection to {} failed: {}", target, e))?;
+
+    eprintln!("Connected. Collecting command output...");
+
+    let mut collected = String::new();
+    for cmd in EXTRACTION_COMMANDS {
+        eprintln!("  Running: {}", cmd);
+        let output = conn.run_cmd(cmd)
+            .await
+            .map_err(|e| anyhow::anyhow!("command '{}' failed on {}: {}", cmd, target, e))?;
+        // Write a section header so the file is human-readable
+        collected.push_str(&format!("!!! aycfgextract: {} !!!\n", cmd));
+        collected.push_str(&output);
+        collected.push('\n');
+    }
+
+    eprintln!("All commands collected successfully.");
+    Ok(collected)
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -129,12 +129,14 @@ The `ports.json` structure maps port identifiers to interface name components, d
 
 **Process:**
 
+The steps below are executed **in this order** — each step's output feeds into the next:
+
 1. **Parse** all `interface <name>` blocks from the running config. Classify each as:
    - **Physical port**: `GigabitEthernet0/0`, `FastEthernet0/1`, etc. — enters port grouping
    - **Sub-interface**: `GigabitEthernet0/0.100`, etc. — modeled as `Port0.100` in port assignments, enters port grouping
    - **SVI**: `interface Vlan*` — handled in Stage 3
    - **Virtual**: `Loopback*`, `Tunnel*`, `Port-channel*`, etc. — handled in Stage 4 (literal text in config template)
-2. **Group by structural identity** — ports are in different groups if they differ in:
+2. **Group by structural identity** — ports (including shutdown ports) are grouped using their **full config** (including `shutdown` if present). Ports are in different groups if they differ in:
    - `switchport mode` (access vs. trunk vs. routed)
    - VLAN assignment (`switchport access vlan`, `switchport trunk allowed vlan`, etc.)
    - `channel-group` membership (ports in a port-channel always form a separate service)
@@ -147,11 +149,11 @@ The `ports.json` structure maps port identifiers to interface name components, d
    - Epilogue can overwrite service config lines, so order matters: prologue comes before service config, epilogue after
    - A "deviation" is defined as the exact set of differing lines. Ports must share the identical deviation set to count toward the 3-port threshold
 5. **Prologue/epilogue determination:** Use sorted versions of config lines for comparison purposes, but track the original line order. If the difference can be expressed as a clean prepend (prologue) and/or append (epilogue) in the original unsorted order, do that. If the lines are reordered or interleaved in a way that does not decompose cleanly into prologue + service + epilogue, create a new service instead.
-6. **Shutdown port handling:** Ports with `shutdown` in their config are matched using a three-step priority:
-   - **Step 1: Exact match** — try matching the full config (including `shutdown`) against existing services. If it matches, use it as-is
+6. **Match against existing services** — if an existing service's `port-config.txt` matches a derived service template exactly, reuse it instead of creating a new one
+7. **Shutdown port handling** — after grouping and service creation, apply shutdown matching for ports that ended up in shutdown-specific groups or as deviations. Ports with `shutdown` in their config are matched using a three-step priority:
+   - **Step 1: Exact match** — try matching the full config (including `shutdown`) against existing services (including those just created in steps 2-6). If it matches, use it as-is
    - **Step 2: Strip and re-match** — if no exact match, strip the `shutdown` line, match against services normally, and add `shutdown` as epilogue
    - **Step 3: Shutdown-only** — ports whose only config line is `shutdown` match or create a `shutdown` service
-7. **Match against existing services** — if an existing service's `port-config.txt` matches a derived service template exactly, reuse it instead of creating a new one
 
 **Output:** Service directories (new or matched) and port assignments for the device config.
 
@@ -372,6 +374,29 @@ Round-trip tests are the primary correctness validation:
 5. Assert byte-for-byte equality between normalized outputs
 
 Test fixtures live alongside the existing aycfggen example sets in `docs/examples/`.
+
+## Development Process
+
+Implementation follows the process defined in `docs/specs/process.md`:
+
+- **TDD implementation by Sonnet agents:** All implementation work is performed by Sonnet models using red-green Test-Driven Development (write a failing test, write minimal code to make it pass, refactor).
+- **Frequent green commits:** Each commit represents a stable state where all tests pass.
+- **Opus review cycle:** After each commit, a fresh independent Opus model reviews the changes. Review feedback is implemented via TDD by Sonnet. The cycle repeats until no outstanding review comments remain.
+
+### Suggested Implementation Order
+
+1. **aycfggen prerequisites:** Sub-interface support in `derive_interface_name`, `list_elements()`/`list_services()` trait methods
+2. **IOS config parser:** Parse `show running-config` into structured blocks (physical ports, sub-interfaces, SVIs, virtual interfaces, global config, multi-line constructs)
+3. **Show command parsers:** Parse `show version`, `show inventory`, `show ip interface brief`, `show interfaces status`
+4. **Stage 1:** Hardware profile discovery and interface name reverse-parsing
+5. **Stage 2:** Port grouping, service creation, prologue/epilogue, shutdown handling
+6. **Stage 3:** SVI extraction
+7. **Stage 4:** Global config, config element matching, template generation
+8. **Stage 5:** Variable extraction trait (no-op implementation)
+9. **Stage 6:** Verification and round-trip comparison normalization
+10. **Write-side traits and filesystem implementations**
+11. **CLI and integration with ayclic for live device connections**
+12. **Integration tests:** Full round-trip tests with realistic fixtures
 
 ## Future Considerations
 

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use regex::Regex;
 use std::sync::LazyLock;
+use indexmap::IndexMap;
 use crate::model::LogicalDeviceConfig;
 use crate::sources::{
     ConfigElementSource, ConfigTemplateSource, HardwareTemplateSource,
@@ -8,6 +9,7 @@ use crate::sources::{
 };
 use crate::validate::validate_device;
 use crate::interface_name::{derive_interface_name_for_port_id, resolve_slot_index_base};
+use crate::variables::expand_vars;
 
 /// Expand !!!###<element-name> markers in a template.
 /// Each marker must be the entire content of a line (trimmed).
@@ -81,7 +83,14 @@ pub fn build_port_block(
                 port_assignment.name, module.sku, e
             ))?;
 
-            let port_config = service_source.load_port_config(&port_assignment.service)?;
+            let raw_port_config = service_source.load_port_config(&port_assignment.service)?;
+
+            // Merge device vars (base) with port vars (override)
+            let mut merged_vars: IndexMap<String, String> = config.vars.clone();
+            for (k, v) in &port_assignment.vars {
+                merged_vars.insert(k.clone(), v.clone());
+            }
+            let port_config = expand_vars(&raw_port_config, &merged_vars)?;
 
             // interface line
             output.push_str(&format!("interface {}\n", iface_name));
@@ -142,7 +151,8 @@ pub fn build_svi_block(
     let mut output = String::new();
     for service_name in &unique_services {
         if let Some(svi_content) = service_source.load_svi_config(service_name)? {
-            output.push_str(&svi_content);
+            let expanded = expand_vars(&svi_content, &config.vars)?;
+            output.push_str(&expanded);
         }
     }
 
@@ -272,8 +282,14 @@ pub fn compile_device(
     // Step 3: Load config template.
     let raw_template = template_source.load_template(&config.config_template)?;
 
+    // Step 3b: Expand device-level vars in the template.
+    let var_expanded_template = expand_vars(&raw_template, &config.vars)?;
+
     // Step 4: Expand config elements.
-    let expanded_template = expand_config_elements(&raw_template, element_source)?;
+    let after_elements = expand_config_elements(&var_expanded_template, element_source)?;
+
+    // Step 4b: Expand vars in element content (element apply.txt may also contain variables).
+    let expanded_template = expand_vars(&after_elements, &config.vars)?;
 
     // Step 5: Build port block.
     let (port_block, port_warnings) = build_port_block(&config, hw_source, service_source)?;
@@ -1032,6 +1048,263 @@ mod tests {
                 got_lines, exp_lines, result, expected
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 13: Variable expansion integration tests
+    // -------------------------------------------------------------------------
+
+    fn make_simple_hw_source(sku: &str) -> MockHwSource {
+        let mut ports = IndexMap::new();
+        ports.insert("Port0".to_string(), PortDefinition {
+            name: "GigabitEthernet".to_string(),
+            index: "0/0".to_string(),
+        });
+        let hw_tmpl = HardwareTemplate { vendor: None, slot_index_base: None, ports };
+        let mut templates = HashMap::new();
+        templates.insert(sku.to_string(), hw_tmpl);
+        MockHwSource { templates }
+    }
+
+    #[test]
+    fn test_device_vars_expanded_in_template() {
+        // Device with vars: {"hostname": "switch1"} and template containing hostname {{{hostname}}}
+        // After expansion the output should contain "hostname switch1"
+        let mut device_vars = IndexMap::new();
+        device_vars.insert("hostname".to_string(), "switch1".to_string());
+
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: true,
+            slot_index_base: None,
+            vars: device_vars,
+            modules: vec![],
+        };
+
+        // Template contains a mustache variable
+        let template = "hostname {{{hostname}}}\n<PORTS-CONFIGURATION>\n";
+
+        // Expand vars in template
+        let expanded = crate::variables::expand_vars(template, &config.vars).unwrap();
+        assert!(expanded.contains("hostname switch1"), "device var should be expanded in template, got:\n{}", expanded);
+    }
+
+    #[test]
+    fn test_port_vars_expanded_in_service_config() {
+        // Port with vars: {"location": "Room-A"} and service config containing "description {{{location}}}"
+        let mut port_vars = IndexMap::new();
+        port_vars.insert("location".to_string(), "Room-A".to_string());
+
+        let merged: IndexMap<String, String> = port_vars.clone();
+        let port_config = "description {{{location}}}\n switchport mode access\n";
+        let expanded = crate::variables::expand_vars(port_config, &merged).unwrap();
+        assert!(expanded.contains("description Room-A"), "port var should be expanded in service config, got:\n{}", expanded);
+    }
+
+    #[test]
+    fn test_port_vars_override_device_vars() {
+        // Port vars override device vars for same key
+        let mut device_vars = IndexMap::new();
+        device_vars.insert("location".to_string(), "DataCenter".to_string());
+        device_vars.insert("hostname".to_string(), "switch1".to_string());
+
+        let mut port_vars = IndexMap::new();
+        port_vars.insert("location".to_string(), "Room-A".to_string());
+
+        // Merge: device_vars as base, port_vars override
+        let mut merged = device_vars.clone();
+        for (k, v) in &port_vars {
+            merged.insert(k.clone(), v.clone());
+        }
+
+        let port_config = "description {{{location}}} on {{{hostname}}}\n";
+        let expanded = crate::variables::expand_vars(port_config, &merged).unwrap();
+        assert!(expanded.contains("description Room-A on switch1"),
+            "port vars should override device vars, got:\n{}", expanded);
+    }
+
+    #[test]
+    fn test_vars_expanded_in_config_elements() {
+        // Variables in config element apply.txt should be expanded
+        let mut device_vars = IndexMap::new();
+        device_vars.insert("ntp_server".to_string(), "10.1.2.3".to_string());
+
+        let apply_content = "ntp server {{{ntp_server}}}\n";
+        let expanded = crate::variables::expand_vars(apply_content, &device_vars).unwrap();
+        assert!(expanded.contains("ntp server 10.1.2.3"),
+            "vars in config element content should be expanded, got:\n{}", expanded);
+    }
+
+    #[test]
+    fn test_build_port_block_expands_port_vars() {
+        // build_port_block should expand port-level vars in the service config
+        let hw_source = make_simple_hw_source("TEST-SKU");
+
+        let mut port_vars = IndexMap::new();
+        port_vars.insert("location".to_string(), "Room-A".to_string());
+
+        let port_assignment = PortAssignment {
+            name: "Port0".to_string(),
+            service: "test-svc".to_string(),
+            prologue: None,
+            epilogue: None,
+            vars: port_vars,
+        };
+        let module = Module {
+            sku: "TEST-SKU".to_string(),
+            serial: None,
+            ports: vec![port_assignment],
+        };
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: true,
+            slot_index_base: None,
+            vars: IndexMap::new(),
+            modules: vec![Some(module)],
+        };
+
+        let mut port_configs = HashMap::new();
+        port_configs.insert("test-svc".to_string(), "description {{{location}}}\n switchport mode access\n".to_string());
+        let service_source = MockServiceSource { port_configs, svi_configs: HashMap::new() };
+
+        let (port_block, warnings) = build_port_block(&config, &hw_source, &service_source).unwrap();
+        assert!(warnings.is_empty());
+        assert!(port_block.contains("description Room-A"),
+            "port vars should be expanded in port config, got:\n{}", port_block);
+        assert!(!port_block.contains("{{{location}}}"),
+            "mustache template syntax should not appear in output, got:\n{}", port_block);
+    }
+
+    #[test]
+    fn test_build_port_block_device_vars_in_port_config() {
+        // Device-level vars should also be available in port config
+        let hw_source = make_simple_hw_source("TEST-SKU");
+
+        let mut device_vars = IndexMap::new();
+        device_vars.insert("hostname".to_string(), "switch1".to_string());
+
+        let port_assignment = PortAssignment {
+            name: "Port0".to_string(),
+            service: "test-svc".to_string(),
+            prologue: None,
+            epilogue: None,
+            vars: IndexMap::new(),
+        };
+        let module = Module {
+            sku: "TEST-SKU".to_string(),
+            serial: None,
+            ports: vec![port_assignment],
+        };
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: true,
+            slot_index_base: None,
+            vars: device_vars,
+            modules: vec![Some(module)],
+        };
+
+        let mut port_configs = HashMap::new();
+        port_configs.insert("test-svc".to_string(), "! device {{{hostname}}}\n".to_string());
+        let service_source = MockServiceSource { port_configs, svi_configs: HashMap::new() };
+
+        let (port_block, warnings) = build_port_block(&config, &hw_source, &service_source).unwrap();
+        assert!(warnings.is_empty());
+        assert!(port_block.contains("! device switch1"),
+            "device vars should be available in port config, got:\n{}", port_block);
+    }
+
+    #[test]
+    fn test_build_port_block_port_vars_override_device_vars_in_pipeline() {
+        // Port vars should override device vars when same key exists
+        let hw_source = make_simple_hw_source("TEST-SKU");
+
+        let mut device_vars = IndexMap::new();
+        device_vars.insert("location".to_string(), "DataCenter".to_string());
+
+        let mut port_vars = IndexMap::new();
+        port_vars.insert("location".to_string(), "Room-A".to_string());
+
+        let port_assignment = PortAssignment {
+            name: "Port0".to_string(),
+            service: "test-svc".to_string(),
+            prologue: None,
+            epilogue: None,
+            vars: port_vars,
+        };
+        let module = Module {
+            sku: "TEST-SKU".to_string(),
+            serial: None,
+            ports: vec![port_assignment],
+        };
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: true,
+            slot_index_base: None,
+            vars: device_vars,
+            modules: vec![Some(module)],
+        };
+
+        let mut port_configs = HashMap::new();
+        port_configs.insert("test-svc".to_string(), "description {{{location}}}\n".to_string());
+        let service_source = MockServiceSource { port_configs, svi_configs: HashMap::new() };
+
+        let (port_block, _) = build_port_block(&config, &hw_source, &service_source).unwrap();
+        assert!(port_block.contains("description Room-A"),
+            "port vars should override device vars, got:\n{}", port_block);
+        assert!(!port_block.contains("DataCenter"),
+            "device var value should be overridden by port var, got:\n{}", port_block);
+    }
+
+    #[test]
+    fn test_build_svi_block_expands_device_vars() {
+        // SVI config should be expanded with device-level vars
+        let mut device_vars = IndexMap::new();
+        device_vars.insert("mgmt_vlan".to_string(), "10".to_string());
+
+        let port_assignment = PortAssignment {
+            name: "Port0".to_string(),
+            service: "test-svc".to_string(),
+            prologue: None,
+            epilogue: None,
+            vars: IndexMap::new(),
+        };
+        let module = Module {
+            sku: "TEST-SKU".to_string(),
+            serial: None,
+            ports: vec![port_assignment],
+        };
+        let config = LogicalDeviceConfig {
+            config_template: "test.conf".to_string(),
+            software_image: None,
+            role: None,
+            vendor: None,
+            omit_slot_prefix: true,
+            slot_index_base: None,
+            vars: device_vars,
+            modules: vec![Some(module)],
+        };
+
+        let mut svi_configs = HashMap::new();
+        svi_configs.insert("test-svc".to_string(), "interface Vlan{{{mgmt_vlan}}}\n no shutdown\n".to_string());
+        let service_source = MockServiceSource { port_configs: HashMap::new(), svi_configs };
+
+        let svi_block = build_svi_block(&config, &service_source).unwrap();
+        assert!(svi_block.contains("interface Vlan10"),
+            "device vars should be expanded in SVI config, got:\n{}", svi_block);
+        assert!(!svi_block.contains("{{{mgmt_vlan}}}"),
+            "mustache syntax should not appear in SVI output, got:\n{}", svi_block);
     }
 
     #[test]

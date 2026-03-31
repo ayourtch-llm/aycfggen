@@ -16,6 +16,7 @@ pub mod port_decomposition;
 pub mod svi_extraction;
 pub mod template_builder;
 pub mod variable_extraction;
+pub mod variables;
 pub mod round_trip;
 pub mod extract_cli;
 

@@ -11,6 +11,7 @@ pub mod show_parsers;
 pub mod hardware_discovery;
 pub mod port_decomposition;
 pub mod svi_extraction;
+pub mod template_builder;
 
 /// Regex pattern for config element markers: `!!!###<element-name>`
 /// Element names must match `[a-zA-Z0-9_-]+`.

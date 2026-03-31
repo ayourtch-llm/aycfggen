@@ -8,6 +8,28 @@ The authoritative correctness criterion is **byte-for-byte round-trip**: running
 
 Initially focused on Cisco IOS/IOS XE. The architecture must accommodate future multi-vendor support.
 
+## Prerequisites: aycfggen Changes
+
+The following changes to aycfggen are required before or alongside the extraction implementation:
+
+### Sub-interface support in `derive_interface_name`
+
+The `derive_interface_name` function must be extended to handle sub-interface suffixes. When a port assignment references a port identifier with a `.N` suffix (e.g., `Port0.100`):
+
+1. Strip the `.N` suffix to find the parent port (`Port0`)
+2. Look up the parent port in the hardware profile's `ports.json`
+3. Derive the base interface name as usual (e.g., `GigabitEthernet0/0` or `GigabitEthernet1/0/0`)
+4. Append the `.N` suffix to produce the final name (e.g., `GigabitEthernet0/0.100`)
+
+Hardware profiles (`ports.json`) contain **only physical ports**. Sub-interfaces are purely a property of port assignments. This means `ports.json` has `Port0` with `{"name": "GigabitEthernet", "index": "0/0"}`, and the port assignment `Port0.100` resolves through the parent.
+
+### Enumeration methods on source traits
+
+The existing `sources.rs` read-side traits need enumeration methods for extraction to discover available data:
+
+- `ConfigElementSource::list_elements() -> Vec<String>` — enumerate all config element names
+- `ServiceSource::list_services() -> Vec<String>` — enumerate all service names
+
 ## CLI Interface
 
 ### Arguments
@@ -84,7 +106,7 @@ The extraction proceeds in six stages:
 1. Determine module count from `show inventory` first — this controls interface name parsing
 2. Parse `show inventory` to identify PIDs (SKUs) and serial numbers per slot
 3. Parse interface names from `show ip interface brief`, using the module count to determine whether interface names include a slot prefix
-4. Extract slot numbers and group interfaces by slot/module
+4. Extract slot numbers and group **physical** interfaces by slot/module (sub-interfaces are not included in `ports.json`)
 5. Match each slot's interfaces to its PID from inventory
 6. Determine slot configuration:
    - `omit-slot-prefix: true` — only when there is exactly one module and interface names contain no slot prefix
@@ -93,11 +115,13 @@ The extraction proceeds in six stages:
 8. For mixed stacks (different slots with different PIDs): each slot gets its own hardware profile
 9. Extract the software image filename from `show version` output for the `software-image` field in the device config
 
-**Interface name reverse-parsing:** Given an interface name like `GigabitEthernet1/0/3`, the parser splits it by matching known Cisco interface name prefixes (`GigabitEthernet`, `FastEthernet`, `TenGigabitEthernet`, `TwentyFiveGigE`, `FortyGigabitEthernet`, `HundredGigE`, `Serial`, `Loopback`, `Vlan`, `Port-channel`, `Tunnel`, etc.). After stripping the prefix, the first number segment is the slot (if multi-module), and the remainder is the port index. The module count from `show inventory` determines whether the first number is a slot or part of the port index. This prefix list must be extensible for future platforms.
+**Interface name reverse-parsing:** Given an interface name like `GigabitEthernet1/0/3`, the parser splits it by matching known Cisco interface name prefixes (`GigabitEthernet`, `FastEthernet`, `TenGigabitEthernet`, `TwentyFiveGigE`, `FortyGigabitEthernet`, `HundredGigE`, `Serial`, `Loopback`, `Vlan`, `Port-channel`, `Tunnel`, etc.). After stripping the prefix, the module count from `show inventory` determines whether the first number is a slot or part of the port index. For multi-module devices, the first number segment is the slot and the remainder is the port index. For single-module devices, the entire numeric portion is the port index. This prefix list must be extensible for future platforms.
+
+For sub-interfaces (e.g., `GigabitEthernet0/0.100`), the `.100` suffix is stripped before the above parsing. The sub-interface number is not part of the hardware profile — it appears only in port assignments as `Port0.100`.
 
 **Output:** For each unique SKU, a `ports.json` file in the hardware templates directory (if one does not already exist, or if `--recreate-hardware-profiles` is set).
 
-The `ports.json` structure maps port identifiers to interface name components, derived directly from the parsed interface names on the device.
+The `ports.json` structure maps port identifiers to interface name components, derived directly from the parsed **physical** interface names on the device. Sub-interfaces do not appear in `ports.json`.
 
 ### Stage 2: Port Configuration Decomposition
 
@@ -139,7 +163,7 @@ The `ports.json` structure maps port identifiers to interface name components, d
 
 1. Parse all `interface Vlan<N>` blocks from the running config
 2. For each SVI, determine which service references VLAN N (from Stage 2)
-3. **First service wins** — the first service (by discovery order) that references a VLAN gets the SVI block as its `svi-config.txt`
+3. **First service wins** — the first service *created* during Stage 2 processing (which follows the interface block order in `show running-config`) that references a VLAN gets the SVI block as its `svi-config.txt`
 4. Other services referencing the same VLAN do not carry the SVI config — aycfggen's deduplication during compilation handles this correctly
 5. If the user later wants a different service to own the SVI, they can manually duplicate the definition
 
@@ -153,11 +177,11 @@ The `ports.json` structure maps port identifiers to interface name components, d
 
 1. Extract all global configuration lines — everything outside of physical port, sub-interface, and SVI `interface` blocks
 2. This includes virtual interface blocks (Loopback, Tunnel, Port-channel), which are kept as literal text in the config template (see "Virtual Interfaces" below)
-3. **Config element matching** against existing config elements, processed in **longest-match-first** order: for each config element in the data store (sorted by `apply.txt` length, descending), check if its `apply.txt` content appears as a contiguous block in the global config. Once lines are consumed by a match, they are unavailable to subsequent elements. This prevents a smaller element from "stealing" lines that belong to a larger one.
+3. **Config element matching** against existing config elements (enumerated via `list_elements()`), processed in **longest-match-first** order: for each config element in the data store (sorted by `apply.txt` length, descending), check if its `apply.txt` content appears as a contiguous block in the global config. Bare `!` separator lines between candidate lines are **ignored** during matching (since IOS inserts them unpredictably). Matching is **whitespace-sensitive** (indentation matters). Once lines are consumed by a match, they are unavailable to subsequent elements. This prevents a smaller element from "stealing" lines that belong to a larger one.
 4. Matched blocks are replaced with `!!!###<element-name>` markers in the config template
 5. **Unmatched global config lines remain as literal text** in the config template — this guarantees round-trip correctness regardless of config element recognition
-6. Place `<PORTS-CONFIGURATION>` marker where the first physical port interface block appeared in the original running config
-7. Place `<SVI-CONFIGURATION>` marker where the first `interface Vlan*` block appeared in the original running config
+6. Place `<PORTS-CONFIGURATION>` marker where the first physical port or sub-interface block appeared in the original running config. If no physical ports or sub-interfaces exist, **omit the marker** — aycfggen's fallback behavior (appending at the end) handles this case.
+7. Place `<SVI-CONFIGURATION>` marker where the first `interface Vlan*` block appeared in the original running config. If no SVIs exist, **omit the marker**.
 8. When creating new config element directories, include a placeholder `unapply.txt` with the content `! FIXME - needs to be generated`
 
 **Multi-line constructs:** The parser must correctly handle multi-line blocks with non-standard delimiters:
@@ -218,13 +242,14 @@ Byte-for-byte comparison between the original `show running-config` and the aycf
 **Normalization procedure (applied to both sides before comparison):**
 
 1. Remove all lines that consist solely of `!` optionally followed by whitespace (bare separator lines)
-2. Remove lines matching these specific aycfggen-generated patterns:
-   - `! config-element: <name>` (config element comment headers)
-   - `! PORTS-START`
-   - `! PORTS-END`
-   - `! SVI-START`
-   - `! SVI-END`
-   - `! use <PORTS-CONFIGURATION> marker` / `! use <SVI-CONFIGURATION> marker` (fallback guidance comments)
+2. Remove lines matching these specific aycfggen-generated patterns (matched at the start of line with no leading whitespace):
+   - `^! config-element: .+$` (config element comment headers)
+   - `^! PORTS-START$`
+   - `^! PORTS-END$`
+   - `^! SVI-START$`
+   - `^! SVI-END$`
+   - `^! use <PORTS-CONFIGURATION>` (fallback guidance comments, prefix match)
+   - `^! use <SVI-CONFIGURATION>` (fallback guidance comments, prefix match)
 3. Strip trailing whitespace from all remaining lines
 4. Remove trailing blank lines
 
@@ -274,7 +299,6 @@ The `config.json` follows the existing aycfggen schema:
         {
           "name": "Port0",
           "service": "access-vlan10",
-          "prologue": "",
           "epilogue": "no cdp enable"
         }
       ]
@@ -282,6 +306,8 @@ The `config.json` follows the existing aycfggen schema:
   ]
 }
 ```
+
+Note: prologue and epilogue fields use `null`/absent (not empty string) when there is no prologue or epilogue. This is consistent with the `Option<String>` representation in the data model.
 
 ## Virtual Interfaces
 
@@ -291,9 +317,13 @@ This is a pragmatic choice for the initial implementation. These interfaces do n
 
 ## Sub-interfaces
 
-Sub-interfaces (`GigabitEthernet0/0.100`, etc.) are modeled as ports with extended naming: `Port0.100` in the hardware profile and port assignments. This allows them to participate in the service model and port grouping (Stage 2), which is natural for router-on-a-stick deployments where multiple sub-interfaces share identical encapsulation + IP assignment patterns.
+Sub-interfaces (`GigabitEthernet0/0.100`, etc.) are modeled as ports with extended naming in port assignments: `Port0.100`. The `.N` suffix is the sub-interface number, and the prefix (`Port0`) refers to the parent physical port in the hardware profile.
 
-The sub-interface number (after the `.`) is part of the port identifier, not the slot. For example, `GigabitEthernet1/0/0.100` on a multi-module device has slot=1, port index=`0/0`, sub-interface=100, mapped to `Port0.100` in the module at slot 1.
+**Hardware profiles (`ports.json`) contain only physical ports.** Sub-interfaces do not appear in `ports.json`. The `derive_interface_name` function resolves `Port0.100` by looking up the parent `Port0`, deriving the base interface name, and appending `.100`.
+
+For example, `GigabitEthernet1/0/0.100` on a multi-module device has slot=1, port index=`0/0`, sub-interface=100. In the hardware profile: `Port0: {"name": "GigabitEthernet", "index": "0/0"}`. In the port assignment: `"name": "Port0.100"`.
+
+This allows sub-interfaces to participate in the service model and port grouping (Stage 2), which is natural for router-on-a-stick deployments where multiple sub-interfaces share identical encapsulation + IP assignment patterns.
 
 ## Service Naming Convention
 
@@ -323,13 +353,13 @@ The mockios simulator in `../ayclic/mockios/` generates realistic IOS command ou
 ### Unit Tests
 
 - Parser tests for each `show` command output format (using realistic fixtures, potentially generated via mockios)
-- Interface name reverse-parsing tests
+- Interface name reverse-parsing tests (including sub-interfaces)
 - Port grouping/clustering algorithm tests
 - Prologue/epilogue derivation tests
 - Shutdown port matching tests
-- Config element matching tests (including overlap/priority)
+- Config element matching tests (including overlap/priority and bare `!` separator handling)
 - Round-trip comparison normalization tests
-- Sub-interface modeling tests
+- Sub-interface port assignment tests
 
 ### Integration Tests
 

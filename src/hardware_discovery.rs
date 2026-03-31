@@ -320,10 +320,12 @@ pub fn discover_hardware(
     let mut modules: Vec<DiscoveredModule> = Vec::new();
 
     for &slot in &all_slots {
-        // Find inventory item whose 0-based slot maps to this interface slot
+        // Find inventory item whose slot matches this interface slot.
+        // Inventory slot numbers map directly to interface slot numbers
+        // (e.g., "Switch 1" → slot 1 → GigabitEthernet1/0/X).
         let inv_item: Option<&InventoryItem> = slotted
             .iter()
-            .find(|i| i.slot.unwrap() + slot_index_base == slot)
+            .find(|i| i.slot.unwrap() == slot)
             .copied()
             .or(fallback_inv);
 
@@ -804,10 +806,10 @@ GigabitEthernet3/0/2   unassigned      YES unset  up                    up
         assert_eq!(device.slot_index_base, 1);
         // Should have 2 modules (slots 1 and 3 from interfaces)
         assert_eq!(device.modules.len(), 2);
-        // Slot 1 matches inventory Switch 1 (inv slot 0, +1 = iface slot 1)
+        // Slot 1 matches inventory "Switch 1" (slot 1 direct)
         assert_eq!(device.modules[0].serial, "FOC_SW1");
         assert_eq!(device.modules[0].slot, 1);
-        // Slot 3 matches inventory Switch 3 (inv slot 2, +1 = iface slot 3)
+        // Slot 3 matches inventory "Switch 3" (slot 3 direct)
         assert_eq!(device.modules[1].serial, "FOC_SW3");
         assert_eq!(device.modules[1].slot, 3);
     }

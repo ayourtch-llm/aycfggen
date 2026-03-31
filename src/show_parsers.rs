@@ -184,10 +184,12 @@ fn extract_quoted_after(line: &str, key: &str) -> Option<String> {
 /// Try to parse a slot number from an inventory item name like "Switch 1", "module 1", "Gi1/1".
 fn parse_slot_from_name(name: &str) -> Option<u32> {
     let lower = name.to_lowercase();
-    // "Switch 1" → slot 1 (1-based → 0-based)
+    // "Switch 1" → slot 1 (direct mapping to interface slot number).
+    // Cisco stacking uses 1-based switch numbers that correspond directly
+    // to the slot number in interface names (e.g., GigabitEthernet1/0/1).
     if let Some(rest) = lower.strip_prefix("switch ") {
         if let Ok(n) = rest.trim().parse::<u32>() {
-            return Some(n.saturating_sub(1));
+            return Some(n);
         }
     }
     // "module 0" → slot 0
@@ -505,12 +507,12 @@ PID: CAB-TA-NA      , VID: V01  , SN: LIT19381A00
         assert_eq!(items[0].name, "Switch 1");
         assert_eq!(items[0].pid, "WS-C3850-24T");
         assert_eq!(items[0].serial, "FOC2001A1BB");
-        assert_eq!(items[0].slot, Some(0));
+        assert_eq!(items[0].slot, Some(1));
 
         assert_eq!(items[1].name, "Switch 2");
         assert_eq!(items[1].pid, "WS-C3850-24T");
         assert_eq!(items[1].serial, "FOC2001A1CC");
-        assert_eq!(items[1].slot, Some(1));
+        assert_eq!(items[1].slot, Some(2));
 
         // Power supply: no slot parsed
         assert_eq!(items[2].name, "Switch 1 - Power Supply A");

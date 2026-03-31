@@ -137,23 +137,46 @@ pub fn extract_device(
     let decomp = decompose_ports(&port_blocks, existing_services, &port_id_map);
 
     // ── Stage 3: SVI extraction ───────────────────────────────────────────────
-    // Build service_vlans: which VLANs does each service reference?
-    let service_vlans = build_service_vlans(&decomp.services);
+    // Build service_vlans: include BOTH new services and existing services that were matched.
+    // We need the existing services' VLAN info too, or SVIs won't be assigned to reused services.
+    let mut all_service_configs: Vec<(&str, &str)> = Vec::new();
+    for svc in &decomp.services {
+        all_service_configs.push((&svc.name, &svc.port_config));
+    }
+    // Add existing services that were actually used by ports
+    let used_existing: std::collections::HashSet<&str> = decomp.ports.iter()
+        .map(|p| p.service_name.as_str())
+        .filter(|name| !decomp.services.iter().any(|s| s.name == *name))
+        .collect();
+    for name in &used_existing {
+        if let Some(content) = existing_services.get(*name) {
+            all_service_configs.push((name, content));
+        }
+    }
 
-    // Service creation order follows decomp.services order
-    let service_creation_order: Vec<String> = decomp.services.iter().map(|s| s.name.clone()).collect();
+    let service_vlans = build_service_vlans_from_pairs(&all_service_configs);
+
+    // Service creation order: new services first (in decomp order), then existing services
+    let mut service_creation_order: Vec<String> = decomp.services.iter().map(|s| s.name.clone()).collect();
+    for name in &used_existing {
+        service_creation_order.push(name.to_string());
+    }
 
     let svi_result = extract_svis(&svi_blocks, &service_vlans, &service_creation_order);
 
-    // Add unmatched SVIs back as literal text into global sections.
-    // They go after the SVI marker in the global sections.
-    // We add them as Config sections containing the literal text lines.
-    for unmatched in &svi_result.unmatched {
-        let lines: Vec<String> = unmatched.literal_text.lines().map(|l| l.to_string()).collect();
-        if !lines.is_empty() {
-            // Find insertion point — after SVI marker if present
-            // For simplicity, append to global sections (will be placed after markers)
-            global_sections.push(GlobalSection::Config(lines));
+    // Add unmatched SVIs back as literal text into global sections,
+    // inserted immediately after the SVI marker to preserve original ordering.
+    if !svi_result.unmatched.is_empty() {
+        let svi_marker_pos = global_sections.iter().position(|s| matches!(s, GlobalSection::SviMarker));
+        let insert_pos = svi_marker_pos.map(|p| p + 1).unwrap_or(global_sections.len());
+
+        let mut offset = 0;
+        for unmatched in &svi_result.unmatched {
+            let lines: Vec<String> = unmatched.literal_text.lines().map(|l| l.to_string()).collect();
+            if !lines.is_empty() {
+                global_sections.insert(insert_pos + offset, GlobalSection::Config(lines));
+                offset += 1;
+            }
         }
     }
 
@@ -218,13 +241,13 @@ fn build_port_id_map(device: &DiscoveredDevice) -> HashMap<String, String> {
 
 // ─── Helper: build service → VLANs map ────────────────────────────────────────
 
-/// Extract which VLANs each service references from its port-config.txt content.
-fn build_service_vlans(services: &[DerivedService]) -> HashMap<String, Vec<u16>> {
+/// Extract VLANs from port-config content for a list of (name, content) pairs.
+fn build_service_vlans_from_pairs(services: &[(&str, &str)]) -> HashMap<String, Vec<u16>> {
     let mut result: HashMap<String, Vec<u16>> = HashMap::new();
 
-    for svc in services {
+    for &(name, content) in services {
         let mut vlans: Vec<u16> = Vec::new();
-        for line in svc.port_config.lines() {
+        for line in content.lines() {
             let trimmed = line.trim();
             // Access port VLAN
             if let Some(rest) = trimmed.strip_prefix("switchport access vlan ") {
@@ -234,11 +257,12 @@ fn build_service_vlans(services: &[DerivedService]) -> HashMap<String, Vec<u16>>
                     }
                 }
             }
-            // Trunk allowed VLANs
+            // Trunk allowed VLANs (also matches "switchport trunk allowed vlan add ...")
             if let Some(rest) = trimmed.strip_prefix("switchport trunk allowed vlan ") {
-                for part in rest.trim().split(',') {
+                // Strip optional "add " prefix
+                let vlan_list = rest.strip_prefix("add ").unwrap_or(rest);
+                for part in vlan_list.trim().split(',') {
                     let part = part.trim();
-                    // Handle ranges like "10-20"
                     if let Some((start, end)) = part.split_once('-') {
                         if let (Ok(s), Ok(e)) = (start.parse::<u16>(), end.parse::<u16>()) {
                             for v in s..=e {
@@ -254,9 +278,17 @@ fn build_service_vlans(services: &[DerivedService]) -> HashMap<String, Vec<u16>>
                     }
                 }
             }
+            // Native VLAN on trunk
+            if let Some(rest) = trimmed.strip_prefix("switchport trunk native vlan ") {
+                if let Ok(v) = rest.trim().parse::<u16>() {
+                    if !vlans.contains(&v) {
+                        vlans.push(v);
+                    }
+                }
+            }
         }
         if !vlans.is_empty() {
-            result.insert(svc.name.clone(), vlans);
+            result.insert(name.to_string(), vlans);
         }
     }
 
@@ -270,13 +302,12 @@ fn build_device_config(
     ports: &[crate::port_decomposition::DecomposedPort],
     template_name: &str,
 ) -> LogicalDeviceConfig {
-    // Build a map from port_id to DecomposedPort for lookup
-    let port_map: HashMap<&str, &crate::port_decomposition::DecomposedPort> =
-        ports.iter().map(|p| (p.port_id.as_str(), p)).collect();
+    // Build a map from interface_name to DecomposedPort for lookup.
+    // Interface names are unique across all modules, unlike port_ids which repeat.
+    let iface_map: HashMap<&str, &crate::port_decomposition::DecomposedPort> =
+        ports.iter().map(|p| (p.interface_name.as_str(), p)).collect();
 
     // Determine the slot range to decide how many module slots to emit.
-    // For single-module devices: just one slot.
-    // For multi-module: slot indices from slot_index_base to max_slot (with None for gaps).
     let max_slot = device.modules.iter().map(|m| m.slot).max().unwrap_or(0);
     let min_slot = device.slot_index_base;
 
@@ -284,13 +315,20 @@ fn build_device_config(
     let modules: Vec<Option<Module>> = (min_slot..=max_slot)
         .map(|slot| {
             let discovered = device.modules.iter().find(|m| m.slot == slot)?;
-            // Collect port assignments for this module
+            // Collect port assignments for this module by reconstructing the interface name
+            // for each port and looking it up in the decomposed ports.
             let port_assignments: Vec<PortAssignment> = discovered
                 .hardware_template
                 .ports
                 .iter()
-                .filter_map(|(port_id, _)| {
-                    let dp = port_map.get(port_id.as_str())?;
+                .filter_map(|(port_id, port_def)| {
+                    // Reconstruct the interface name for this port in this module
+                    let iface_name = if device.omit_slot_prefix {
+                        format!("{}{}", port_def.name, port_def.index)
+                    } else {
+                        format!("{}{}/{}", port_def.name, slot, port_def.index)
+                    };
+                    let dp = iface_map.get(iface_name.as_str())?;
                     Some(PortAssignment {
                         name: port_id.clone(),
                         service: dp.service_name.clone(),

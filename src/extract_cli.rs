@@ -310,9 +310,52 @@ fn run_extract_sections(
         }
     }
 
-    // Write new services (port-config + vars.json)
+    // Write new services (port-config + vars.json).
+    // For standalone SVI services (empty port-config), check if an existing service
+    // on disk already has identical SVI content for the same VLAN — reuse it if so.
     let service_sink = FsServiceSink::new(dirs.services.clone());
+    let svc_source_for_svi = FsServiceSource::new(dirs.services.clone());
+    let mut svi_service_renames: HashMap<String, String> = HashMap::new();
     for svc in &output.services {
+        // Check if this is a standalone SVI service that can be deduplicated
+        let is_standalone_svi = svc.port_config.trim().is_empty() && svc.vlan.is_some();
+        if is_standalone_svi {
+            // Find matching SVI assignment to get the content
+            let svi_content = output.svi_assignments.iter()
+                .find(|a| a.service_name == svc.name)
+                .map(|a| a.svi_config.as_str());
+            if let Some(content) = svi_content {
+                // Scan existing services for a match
+                let mut found_reuse = false;
+                let all_services = svc_source_for_svi.list_services().unwrap_or_default();
+                for existing_name in &all_services {
+                    if existing_name == &svc.name {
+                        continue; // Don't match against ourselves
+                    }
+                    let vars = match svc_source_for_svi.load_service_vars(existing_name).unwrap_or(None) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if vars.vlan != svc.vlan {
+                        continue;
+                    }
+                    if let Some(existing_svi) = svc_source_for_svi.load_svi_config(existing_name).unwrap_or(None) {
+                        if existing_svi.trim() == content.trim() {
+                            eprintln!(
+                                "  Standalone SVI '{}': reusing existing '{}'",
+                                svc.name, existing_name
+                            );
+                            svi_service_renames.insert(svc.name.clone(), existing_name.clone());
+                            found_reuse = true;
+                            break;
+                        }
+                    }
+                }
+                if found_reuse {
+                    continue; // Skip writing this service
+                }
+            }
+        }
         service_sink.write_port_config(&svc.name, &svc.port_config)?;
         if let Some(vlan) = svc.vlan {
             service_sink.write_service_vars(&svc.name, &crate::model::ServiceVars {
@@ -324,14 +367,29 @@ fn run_extract_sections(
     // Write SVI configs for services that have them.
     // If the service already has an SVI on disk with different content, find or create
     // a standalone SVI service to avoid cross-device conflicts.
-    let svc_source_for_svi = FsServiceSource::new(dirs.services.clone());
+    // Apply renames from standalone SVI deduplication above.
     let mut extra_svi_services: Vec<String> = Vec::new();
     let mut replaced_svi_services: std::collections::HashSet<String> = std::collections::HashSet::new();
     for svi_assignment in &output.svi_assignments {
         let svi_vlan = svi_assignment.vlan as u32;
+        let effective_name = svi_service_renames.get(&svi_assignment.service_name)
+            .cloned()
+            .unwrap_or_else(|| svi_assignment.service_name.clone());
+
+        // If this SVI was renamed to an existing service, skip writing (it's already there)
+        if svi_service_renames.contains_key(&svi_assignment.service_name) {
+            // Track the rename so device config gets updated
+            if effective_name != svi_assignment.service_name {
+                replaced_svi_services.insert(svi_assignment.service_name.clone());
+                if !extra_svi_services.contains(&effective_name) {
+                    extra_svi_services.push(effective_name);
+                }
+            }
+            continue;
+        }
 
         // Check if the service already has an SVI config on disk
-        let existing_svi = svc_source_for_svi.load_svi_config(&svi_assignment.service_name)
+        let existing_svi = svc_source_for_svi.load_svi_config(&effective_name)
             .unwrap_or(None);
 
         let needs_standalone = match &existing_svi {
@@ -346,16 +404,16 @@ fn run_extract_sections(
                 &output.device.serial_number,
                 svi_assignment.vlan,
                 &svi_assignment.svi_config,
-                &svi_assignment.service_name,
+                &effective_name,
             )?;
             replaced_svi_services.insert(svi_assignment.service_name.clone());
             extra_svi_services.push(svi_name);
         } else {
             // Write the SVI to the shared service (first writer wins, or identical)
-            service_sink.write_svi_config(&svi_assignment.service_name, &svi_assignment.svi_config)?;
+            service_sink.write_svi_config(&effective_name, &svi_assignment.svi_config)?;
             // Also write vars.json for standalone SVI services if not already written
-            if !output.services.iter().any(|s| s.name == svi_assignment.service_name && s.vlan.is_some()) {
-                service_sink.write_service_vars(&svi_assignment.service_name, &crate::model::ServiceVars {
+            if !output.services.iter().any(|s| s.name == effective_name && s.vlan.is_some()) {
+                service_sink.write_service_vars(&effective_name, &crate::model::ServiceVars {
                     vlan: Some(svi_vlan),
                 })?;
             }

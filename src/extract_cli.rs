@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use anyhow::Result;
+use crate::fs_sinks::FsServiceSink;
+use crate::fs_sources::FsServiceSource;
+use crate::sinks::ServiceSink;
 
 // ─── ExtractArgs ──────────────────────────────────────────────────────────────
 
@@ -179,6 +182,51 @@ pub fn run_extract_offline(
     Ok(())
 }
 
+/// Find or create a standalone SVI service for a given VLAN.
+///
+/// Before creating a new `svi-<serial>-vlan<N>` service, scans existing `svi-*-vlan<N>`
+/// services on disk. If one already has identical SVI content, reuses it.
+fn find_or_create_standalone_svi(
+    svc_source: &FsServiceSource,
+    service_sink: &FsServiceSink,
+    serial: &str,
+    vlan: u16,
+    svi_content: &str,
+    conflicting_service: &str,
+) -> Result<String> {
+    use crate::sources::ServiceSource;
+
+    // Check existing standalone SVIs for this VLAN
+    let all_services = svc_source.list_services().unwrap_or_default();
+    let vlan_suffix = format!("-vlan{}", vlan);
+    for existing_name in &all_services {
+        if existing_name.starts_with("svi-") && existing_name.ends_with(&vlan_suffix) {
+            if let Some(existing_content) = svc_source.load_svi_config(existing_name).unwrap_or(None) {
+                if existing_content.trim() == svi_content.trim() {
+                    eprintln!(
+                        "  SVI conflict on '{}' vlan {}: reusing existing '{}'",
+                        conflicting_service, vlan, existing_name
+                    );
+                    return Ok(existing_name.clone());
+                }
+            }
+        }
+    }
+
+    // No match found — create a new one
+    let standalone_name = format!("svi-{}-vlan{}", serial, vlan);
+    eprintln!(
+        "  SVI conflict on '{}' vlan {}: creating standalone '{}'",
+        conflicting_service, vlan, standalone_name
+    );
+    service_sink.write_port_config(&standalone_name, "")?;
+    service_sink.write_svi_config(&standalone_name, svi_content)?;
+    service_sink.write_service_vars(&standalone_name, &crate::model::ServiceVars {
+        vlan: Some(vlan as u32),
+    })?;
+    Ok(standalone_name)
+}
+
 /// Run the extraction pipeline for a single device given its command sections.
 fn run_extract_sections(
     full_content: &str,
@@ -268,8 +316,8 @@ fn run_extract_sections(
     }
 
     // Write SVI configs for services that have them.
-    // If the service already has an SVI on disk with different content, create a
-    // per-device standalone SVI service instead to avoid cross-device conflicts.
+    // If the service already has an SVI on disk with different content, find or create
+    // a standalone SVI service to avoid cross-device conflicts.
     let svc_source_for_svi = FsServiceSource::new(dirs.services.clone());
     let mut extra_svi_services: Vec<String> = Vec::new();
     let mut replaced_svi_services: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -281,27 +329,21 @@ fn run_extract_sections(
             .unwrap_or(None);
 
         let needs_standalone = match &existing_svi {
-            Some(existing) => {
-                // Normalize both for comparison (trailing newline differences)
-                existing.trim() != svi_assignment.svi_config.trim()
-            }
+            Some(existing) => existing.trim() != svi_assignment.svi_config.trim(),
             None => false,
         };
 
         if needs_standalone {
-            // SVI content conflicts with what's already stored — create per-device standalone
-            let standalone_name = format!("svi-{}-vlan{}", output.device.serial_number, svi_assignment.vlan);
-            eprintln!(
-                "  SVI conflict on service '{}' vlan {}: creating standalone '{}'",
-                svi_assignment.service_name, svi_assignment.vlan, standalone_name
-            );
-            service_sink.write_port_config(&standalone_name, "")?;
-            service_sink.write_svi_config(&standalone_name, &svi_assignment.svi_config)?;
-            service_sink.write_service_vars(&standalone_name, &crate::model::ServiceVars {
-                vlan: Some(svi_vlan),
-            })?;
+            let svi_name = find_or_create_standalone_svi(
+                &svc_source_for_svi,
+                &service_sink,
+                &output.device.serial_number,
+                svi_assignment.vlan,
+                &svi_assignment.svi_config,
+                &svi_assignment.service_name,
+            )?;
             replaced_svi_services.insert(svi_assignment.service_name.clone());
-            extra_svi_services.push(standalone_name);
+            extra_svi_services.push(svi_name);
         } else {
             // Write the SVI to the shared service (first writer wins, or identical)
             service_sink.write_svi_config(&svi_assignment.service_name, &svi_assignment.svi_config)?;
@@ -353,19 +395,16 @@ fn run_extract_sections(
                         // Does this device have its own SVI for this VLAN?
                         if let Some(device_svi) = device_svi_by_vlan.get(&vlan_num) {
                             if disk_svi.trim() != device_svi.trim() {
-                                // Conflict: shared service has wrong SVI for this device
-                                let standalone_name = format!("svi-{}-vlan{}", output.device.serial_number, vlan_num);
-                                if !extra_svi_services.contains(&standalone_name) {
-                                    eprintln!(
-                                        "  SVI override for service '{}' vlan {}: creating standalone '{}'",
-                                        svc_name, vlan_num, standalone_name
-                                    );
-                                    service_sink.write_port_config(&standalone_name, "")?;
-                                    service_sink.write_svi_config(&standalone_name, device_svi)?;
-                                    service_sink.write_service_vars(&standalone_name, &crate::model::ServiceVars {
-                                        vlan: Some(vlan_num as u32),
-                                    })?;
-                                    extra_svi_services.push(standalone_name);
+                                let svi_name = find_or_create_standalone_svi(
+                                    &svc_source_for_svi,
+                                    &service_sink,
+                                    &output.device.serial_number,
+                                    vlan_num,
+                                    device_svi,
+                                    svc_name,
+                                )?;
+                                if !extra_svi_services.contains(&svi_name) {
+                                    extra_svi_services.push(svi_name);
                                 }
                             }
                         }

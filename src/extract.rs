@@ -185,7 +185,7 @@ pub fn extract_device(
         }
         // Use device serial in the name to avoid conflicts when multiple devices
         // share a services directory but have different SVI content for the same VLAN.
-        let svc_name = format!("svi-{}-vlan{}", device.serial_number, unmatched.vlan);
+        let svc_name = format!("svi-vlan{}-{}", unmatched.vlan, device.serial_number);
         standalone_svi_services.push(DerivedService {
             name: svc_name.clone(),
             port_config: String::new(),

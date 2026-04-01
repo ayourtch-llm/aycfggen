@@ -198,9 +198,9 @@ fn find_or_create_standalone_svi(
 
     // Check existing standalone SVIs for this VLAN
     let all_services = svc_source.list_services().unwrap_or_default();
-    let vlan_suffix = format!("-vlan{}", vlan);
+    let vlan_prefix = format!("svi-vlan{}-", vlan);
     for existing_name in &all_services {
-        if existing_name.starts_with("svi-") && existing_name.ends_with(&vlan_suffix) {
+        if existing_name.starts_with(&vlan_prefix) {
             if let Some(existing_content) = svc_source.load_svi_config(existing_name).unwrap_or(None) {
                 if existing_content.trim() == svi_content.trim() {
                     eprintln!(
@@ -214,7 +214,7 @@ fn find_or_create_standalone_svi(
     }
 
     // No match found — create a new one
-    let standalone_name = format!("svi-{}-vlan{}", serial, vlan);
+    let standalone_name = format!("svi-vlan{}-{}", vlan, serial);
     eprintln!(
         "  SVI conflict on '{}' vlan {}: creating standalone '{}'",
         conflicting_service, vlan, standalone_name

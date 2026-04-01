@@ -18,7 +18,10 @@ pub mod template_builder;
 pub mod variable_extraction;
 pub mod variables;
 pub mod round_trip;
+pub mod diff;
 pub mod extract_cli;
+
+pub use diff::unified_diff;
 
 /// Regex pattern for config element markers: `!!!###<element-name>`
 /// Element names must match `[a-zA-Z0-9_-]+`.

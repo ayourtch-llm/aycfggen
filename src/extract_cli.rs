@@ -184,8 +184,8 @@ pub fn run_extract_offline(
 
 /// Find or create a standalone SVI service for a given VLAN.
 ///
-/// Before creating a new `svi-<serial>-vlan<N>` service, scans existing `svi-*-vlan<N>`
-/// services on disk. If one already has identical SVI content, reuses it.
+/// Before creating a new service, scans all existing services on disk.
+/// If one has the same VLAN (from vars.json) and identical SVI content, reuses it.
 fn find_or_create_standalone_svi(
     svc_source: &FsServiceSource,
     service_sink: &FsServiceSink,
@@ -196,19 +196,25 @@ fn find_or_create_standalone_svi(
 ) -> Result<String> {
     use crate::sources::ServiceSource;
 
-    // Check existing standalone SVIs for this VLAN
+    // Scan existing services for one with matching VLAN (from vars.json) and identical SVI content
     let all_services = svc_source.list_services().unwrap_or_default();
-    let vlan_prefix = format!("svi-vlan{}-", vlan);
     for existing_name in &all_services {
-        if existing_name.starts_with(&vlan_prefix) {
-            if let Some(existing_content) = svc_source.load_svi_config(existing_name).unwrap_or(None) {
-                if existing_content.trim() == svi_content.trim() {
-                    eprintln!(
-                        "  SVI conflict on '{}' vlan {}: reusing existing '{}'",
-                        conflicting_service, vlan, existing_name
-                    );
-                    return Ok(existing_name.clone());
-                }
+        // Check vars.json for VLAN match
+        let vars = match svc_source.load_service_vars(existing_name).unwrap_or(None) {
+            Some(v) => v,
+            None => continue,
+        };
+        if vars.vlan != Some(vlan as u32) {
+            continue;
+        }
+        // VLAN matches — check SVI content
+        if let Some(existing_content) = svc_source.load_svi_config(existing_name).unwrap_or(None) {
+            if existing_content.trim() == svi_content.trim() {
+                eprintln!(
+                    "  SVI conflict on '{}' vlan {}: reusing existing '{}'",
+                    conflicting_service, vlan, existing_name
+                );
+                return Ok(existing_name.clone());
             }
         }
     }
